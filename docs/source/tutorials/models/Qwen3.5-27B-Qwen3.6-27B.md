@@ -948,6 +948,8 @@ After about several minutes, you can get the performance evaluation result.
 > **Parallelism Strategy**: `Qwen3.5-27B-w8a8` and `Qwen3.6-27B-w8a8` are only ~30 GB and easily fit in a single NPU (64 GB HBM per NPU). Following the **DP-first** principle, **TP=2 is the recommended default** for most scenarios, and the remaining NPUs should be allocated to DP for parallel request batches. **TP=8 is only recommended for ultra-long context (256K+) scenarios**, where it shards the KV cache across 8 NPUs to maximize the available context window per rank. For `Qwen3.6-27B-w8a8`, you can also raise `--max-model-len` up to 262144 in the same TP/DP layout.
 >
 > **Atlas inference products**: Currently only the TP scenario is supported. Choose **TP=2** or **TP=4** according to the available devices. With **TP=4**, `--max-model-len` can support **128K** and **256K** long-sequence scenarios; configure `--max-num-seqs` as needed—setting it too high may cause OOM.
+>
+> **Ascend950DT series**: The `Qwen3.5-27B-w8a8-MXFP8` and `Qwen3.6-27B-w8a8-MXFP8` model weights easily fit in a single NPU (96 GB HBM per NPU). Following the **DP-first** principle, **TP=1 is the recommended default** for most scenarios, and the remaining NPUs should be allocated to DP for parallel request batches. For `Qwen3.6-27B-w8a8-MXFP8`, `--max-model-len` can support up to **262144** in the same TP=1 + DP=8 layout.
 
 #### Table 1: Scenario Overview
 
@@ -957,8 +959,10 @@ After about several minutes, you can get the performance evaluation result.
 | High Throughput<br>(128K context) | Single-Node (A3) | 16 (A3) | Qwen3.5-27B-w8a8 / Qwen3.6-27B-w8a8 | TP=2 + DP=8 fully utilizes all 16 NPUs for parallel request batches |
 | Low Latency<br>(128K context) | Single-Node (A3) | 16 (A3) | Qwen3.5-27B-w8a8 / Qwen3.6-27B-w8a8 | TP=2 + DP=8 reduces per-layer Allreduce overhead for small interactive batches |
 | Long Context<br>(256K+ context) | Single-Node (A3) | 16 (A3) | Qwen3.5-27B-w8a8 / Qwen3.6-27B-w8a8 | TP=8 + DP=2 shards the KV cache across 8 NPUs to maximize the available context window |
+| High Throughput<br>(128K context) | Single-Node (A5DT) | 8 (A5DT) | Qwen3.5-27B-w8a8-MXFP8 / Qwen3.6-27B-w8a8-MXFP8 | TP=1 + DP=8 fully utilizes all 8 NPUs for parallel request batches |
+| Long Context<br>(256K+ context) | Single-Node (A5DT) | 8 (A5DT) | Qwen3.6-27B-w8a8-MXFP8 | TP=1 + DP=8 maximizes the available context window while keeping all 8 NPUs busy |
 
-> `*Total NPUs` indicates the total number of NPUs used across all nodes. 1 Atlas 800 A3 node = 16 NPUs, 1 Atlas 800 A2 node = 8 NPUs.
+> `*Total NPUs` indicates the total number of NPUs used across all nodes. 1 Atlas 800 A3 node = 16 NPUs, 1 Atlas 800 A2 node = 8 NPUs, 1 Ascend950DT series node = 8 NPUs.
 
 #### Table 2: Detailed Node Configuration
 
@@ -968,6 +972,8 @@ After about several minutes, you can get the performance evaluation result.
 | High Throughput (128K) | Single-Node (A3) | 16 | 2 | 8 | 32 | 16384 | 133000 | 3 | On |
 | Low Latency (128K) | Single-Node (A3) | 16 | 2 | 8 | 4 | 4096 | 133000 | 3 | On |
 | Long Context (256K+) | Single-Node (A3) | 16 | 8 | 2 | 8 | 8192 | 266000 | 3 | On |
+| High Throughput (128K) | Single-Node (A5DT) | 8 | 1 | 8 | 32 | 16384 | 133000 | 3 | On |
+| Long Context (256K+) | Single-Node (A5DT) | 8 | 1 | 8 | 32 | 16384 | 262144 | 3 | On |
 
 > For complete startup commands and parameter descriptions, please refer to the deployment examples in [Chapter 5](#5-online-service-deployment).
 
