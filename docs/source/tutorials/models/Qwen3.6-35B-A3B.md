@@ -201,8 +201,7 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
       --gpu-memory-utilization 0.90 \
       --enable-prefix-caching \
       --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-      --additional-config '{"enable_cpu_binding":true, "enable_flashcomm1":true, "multistream_overlap_shared_expert": true}' \
-      --async-scheduling
+      --additional-config '{"enable_cpu_binding":true, "enable_flashcomm1":true, "multistream_overlap_shared_expert": true}'
     ```
 
     **Key parameters:**
@@ -217,7 +216,6 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
     - `--quantization ascend` enables Ascend quantization for the W8A8 model. Remove this option when deploying the BF16 model.
     - `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` enables full decode ACLGraph replay to reduce dispatch overhead.
     - `--additional-config` enables Ascend-specific optimizations. `enable_flashcomm1` enables FlashComm1, `multistream_overlap_shared_expert` overlaps shared expert computation, and `enable_cpu_binding` enables Ascend-native CPU binding.
-    - `--async-scheduling` enables asynchronous scheduling, which can improve high-concurrency throughput.
 
 === "Atlas inference products"
 
@@ -233,10 +231,10 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
       --max-num-seqs 16 \
       --served-model-name qwen3.6 \
       --dtype float16 \
-      --additional-config '{"ascend_compilation_config": {"fuse_norm_quant": false}}' \
-      --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,2,4,8,16]}' \
+      --additional-config '{"ascend_compilation_config": {"enable_npugraph_ex":false}}' \
+      --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,8]}' \
       --quantization ascend \
-      --max-model-len 16384 \
+      --max-model-len 20480 \
       --no-enable-prefix-caching
     ```
 
@@ -244,14 +242,13 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
 
     - `--tensor-parallel-size 2` maps the model across two Atlas inference devices. Adjust it together with `ASCEND_RT_VISIBLE_DEVICES` according to the available devices and memory.
     - `--dtype float16` is used for Atlas inference products to match the Atlas inference execution path.
-    - `--max-model-len 16384` is intentionally conservative. On Atlas inference products, large context lengths allocate large attention masks, so do not rely on automatic max-model-len detection.
     - `--max-num-seqs 16` limits concurrent active requests to reduce KV cache and graph capture pressure on Atlas inference products.
     - `--gpu-memory-utilization` controls KV cache capacity. Reduce it if startup or runtime requests report OOM.
-    - `--additional-config '{"ascend_compilation_config": {"fuse_norm_quant": false}}'` disables norm-quant fusion for the Atlas inference products serving path.
+    - `--additional-config` with `"ascend_compilation_config": {"enable_npugraph_ex": false}` is required because `enable_npugraph_ex` is not supported on Atlas inference products.
     - `--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,2,4,8,16]}'` enables decode ACLGraph replay and explicitly limits capture sizes for Atlas inference products.
     - `--no-enable-prefix-caching` is the default recommendation for this Atlas inference products example to reduce memory pressure.
     - `--quantization ascend` enables Ascend quantization for the W8A8 model. Remove this option when deploying the BF16 model.
-    - To enable MTP speculative decoding, use --speculative_config '{"method": "mtp", "num_speculative_tokens": 1}'. We recommend setting num_speculative_tokens to 1.
+    - To enable MTP speculative decoding, use --speculative_config '{"method": "mtp", "num_speculative_tokens": 1}'. We recommend setting num_speculative_tokens to 1. If your usage scenario involves fewer than two concurrent requests, it is recommended to enable MTP. Otherwise, it is recommended not to enable MTP.
 
 Common Issues Tip: If the service fails to start, HBM is insufficient, or requests are not scheduled as expected, refer to [FAQs](../../faqs.md) first, and then check the model-specific FAQ in Section 10.
 
@@ -365,7 +362,6 @@ Recommended tuning order:
 | Full decode ACLGraph | `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` | Reduces operator dispatch overhead and stabilizes decode performance. | Recommended for decode-heavy serving. |
 | FlashComm1 | `--additional-config '{"enable_flashcomm1": true}'` | Reduces communication overhead in TP and high-concurrency scenarios. | May not help low-concurrency workloads. |
 | Shared expert overlap | `--additional-config '{"multistream_overlap_shared_expert": true}'` | Overlaps shared expert computation in MoE workloads. | Recommended for throughput scenarios. |
-| Asynchronous scheduling | `--async-scheduling` | Improves high-concurrency throughput by using non-blocking scheduling. | Disable it and compare if the workload is latency-sensitive. |
 | Prefix caching | `--enable-prefix-caching` | Improves repeated-prefix workloads. | Monitor HBM usage for long-context workloads. |
 | Qwen3.6 MTP speculative decoding | `--speculative-config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3, "enforce_eager": true}'` | Can improve decode throughput when stable and accepted tokens are high. | Validate stability, TTFT, TPOT, and throughput for your workload. |
 
@@ -388,11 +384,3 @@ For common environment, installation, and general parameter issues, refer to [FA
 **Cause:** Prefix caching only helps when requests share reusable prefixes. For random prompts or low cache hit rates, it may add memory pressure without visible gains.
 
 **Solution:** Enable prefix caching for repeated-prefix workloads. For random benchmark datasets or memory-constrained long-context workloads, compare with `--no-enable-prefix-caching`.
-
-### Q3: How should I tune async scheduling for Qwen3.6?
-
-**Phenomenon:** Throughput improves in high-concurrency scenarios, but some latency-sensitive workloads may not benefit.
-
-**Cause:** Asynchronous scheduling reduces blocking overhead, but the benefit depends on concurrency, prompt/output length, and graph capture shape.
-
-**Solution:** Use `--async-scheduling` for high-throughput serving. For low-latency serving, compare TTFT and TPOT with and without this option.

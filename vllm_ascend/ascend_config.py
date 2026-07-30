@@ -156,6 +156,14 @@ class AscendConfig:
             ascend_envs.VLLM_ASCEND_ENABLE_FUSED_MC2,
         )
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
+        model_architectures = getattr(vllm_config.model_config, "architectures", None) or []
+        assert not (
+            self.enable_fused_mc2 == 1
+            and any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
+        ), (
+            "MiniMax M3 does not support enable_fused_mc2=1. Please set "
+            "additional_config.enable_fused_mc2 to 0 or unset VLLM_ASCEND_ENABLE_FUSED_MC2."
+        )
         if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
@@ -209,6 +217,11 @@ class AscendConfig:
 
             if self.pd_tp_ratio == 0:
                 raise AssertionError("Only support P node tp size lagger then D node tp size")
+        # We find that _npu_paged_attention still performs better than
+        # npu_fused_infer_attention_score in some cases. We allow to execute
+        # _npu_paged_attention in this cases. This should be removed once
+        # npu_fused_infer_attention_score performs better on all scenarios.
+        self.pa_shape_list = additional_config.get("pa_shape_list", [])
         # Weight NZ mode configuration.
         # 0: disabled, 1: only quant case enable nz (default), 2: BF16/FP16 also enable nz
         self.weight_nz_mode = self._get_config_value(
@@ -233,13 +246,17 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
-        self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
-        self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
-        quant_config = getattr(vllm_config, "quant_config", None)
-        self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
-            quant_config
+        self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
+        self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
+        self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
+            "c8_enable_reshape_optim", False
         )
-        self._sparse_c8_layer_filter_enabled = self._has_sparse_c8_layer_config(quant_config)
+        quant_config = getattr(vllm_config, "quant_config", None)
+        (
+            self._sparse_li_c8_layer_ids,
+            self._sparse_li_c8_layer_names,
+        ) = self._parse_sparse_li_c8_layers_from_quant_config(quant_config)
+        self._sparse_li_c8_layer_filter_enabled = self._has_sparse_li_c8_layer_config(quant_config)
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
@@ -263,10 +280,6 @@ class AscendConfig:
             )
         if self.mega_moe_max_tokens <= 0:
             raise ValueError(f"mega_moe_max_tokens must be a positive integer, got {self.mega_moe_max_tokens}")
-
-        # Whether to use NPU device group for DP metadata all_reduce.
-        # "True": use NPU device group, "False" (default): use CPU group.
-        self.dp_allreduce_on_npu = additional_config.get("dp_allreduce_on_npu", False)
 
         # Enable optimized reduce sampling scheme
         self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
@@ -352,14 +365,15 @@ class AscendConfig:
         return dump_config_path
 
     @staticmethod
-    def _has_sparse_c8_layer_config(quant_config: Any) -> bool:
+    def _has_sparse_li_c8_layer_config(quant_config: Any) -> bool:
         quant_description = getattr(quant_config, "quant_description", None)
         if not isinstance(quant_description, dict):
             return False
-        return any(isinstance(key, str) and key.endswith(".indexer.quant_type") for key in quant_description)
+        quant_suffixes = (".indexer.quant_type", ".indexer.wq_b_weight")
+        return any(isinstance(key, str) and key.endswith(quant_suffixes) for key in quant_description)
 
     @classmethod
-    def _parse_sparse_c8_layers_from_quant_config(cls, quant_config: Any) -> tuple[set[int], set[str]]:
+    def _parse_sparse_li_c8_layers_from_quant_config(cls, quant_config: Any) -> tuple[set[int], set[str]]:
         quant_description = getattr(quant_config, "quant_description", None)
         if not isinstance(quant_description, dict):
             return set(), set()
@@ -384,10 +398,10 @@ class AscendConfig:
             layer_ids.add(extract_layer_index(layer_name))
         return layer_ids, layer_names
 
-    def is_sparse_c8_layer(self, layer_name: str | None) -> bool:
-        if not self.enable_sparse_c8:
+    def is_sparse_li_c8_layer(self, layer_name: str | None) -> bool:
+        if not self.enable_sparse_li_c8:
             return False
-        if not self._sparse_c8_layer_filter_enabled:
+        if not self._sparse_li_c8_layer_filter_enabled:
             return True
         if layer_name is None:
             return False
@@ -395,13 +409,13 @@ class AscendConfig:
         normalized_layer_name = layer_name.rstrip(".")
         if any(
             normalized_layer_name == candidate or normalized_layer_name.startswith(f"{candidate}.")
-            for candidate in self._sparse_c8_layer_names
+            for candidate in self._sparse_li_c8_layer_names
         ):
             return True
         from vllm.model_executor.models.utils import extract_layer_index
 
         layer_ids = {extract_layer_index(normalized_layer_name)}
-        return any(layer_id in self._sparse_c8_layer_ids for layer_id in layer_ids)
+        return any(layer_id in self._sparse_li_c8_layer_ids for layer_id in layer_ids)
 
     @staticmethod
     def _get_compile_ranges(compilation_config):
@@ -528,6 +542,18 @@ class AscendCompilationConfig:
                 Default: True
             **kwargs: Additional optional parameters for forward compatibility and configuration extension.
         """
+        from vllm_ascend.utils import is_310p
+
+        if is_310p():
+            if enable_npugraph_ex:
+                logger.warning("npugraph_ex is not supported on Ascend 310P. Disabling it.")
+            if enable_static_kernel:
+                logger.warning(
+                    "static kernel requires npugraph_ex, which is not supported on Ascend 310P. Disabling it."
+                )
+            enable_npugraph_ex = False
+            enable_static_kernel = False
+
         self.fuse_norm_quant = fuse_norm_quant
         self.fuse_qknorm_rope = fuse_qknorm_rope
         self.enable_npugraph_ex = enable_npugraph_ex
