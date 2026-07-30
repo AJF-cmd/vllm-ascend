@@ -207,6 +207,7 @@ If you don't want to use the docker image as above, you can also build all from 
 
 2. If you want to deploy a multi-node environment, you need to set up the environment on each node.
 
+
 To verify the source code installation, run the following command and confirm the displayed version matches the one you installed:
 
 ```bash
