@@ -432,7 +432,7 @@ def test_final_output_never_all_reduces_sequence_shards(
         (SharedExpertParallelMode.TENSOR_PARALLEL, MoECommType.ALLGATHER, False),
         (SharedExpertParallelMode.SHARED_EXPERT_DATA_PARALLEL_ONLY, MoECommType.MC2, False),
         (SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY, MoECommType.MC2, False),
-        (SharedExpertParallelMode.SEQUENCE_PARALLEL_SDP, MoECommType.MC2, False),
+        (SharedExpertParallelMode.SEQUENCE_PARALLEL_SEDP, MoECommType.MC2, False),
     ],
 )
 def test_shared_output_reduction_depends_on_weight_layout(
@@ -482,7 +482,7 @@ def test_shared_output_reduction_depends_on_weight_layout(
     [
         (SharedExpertParallelMode.TENSOR_PARALLEL, MoECommType.ALLGATHER, False),
         (SharedExpertParallelMode.SHARED_EXPERT_DATA_PARALLEL_ONLY, MoECommType.ALLGATHER, True),
-        (SharedExpertParallelMode.SEQUENCE_PARALLEL_SDP, MoECommType.ALLGATHER, False),
+        (SharedExpertParallelMode.SEQUENCE_PARALLEL_SEDP, MoECommType.ALLGATHER, False),
         (SharedExpertParallelMode.SHARED_EXPERT_DATA_PARALLEL_ONLY, MoECommType.MC2, False),
     ],
 )
