@@ -466,8 +466,7 @@ def test_shared_output_reduction_depends_on_weight_layout(
 
     result = runner._reduce_shared_output_if_needed(
         shared_output,
-        fused_output_is_reduced=moe_comm_type
-        in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2},
+        fused_output_is_reduced=moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2},
     )
 
     if reduce_shared:
