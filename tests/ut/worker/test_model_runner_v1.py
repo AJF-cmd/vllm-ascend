@@ -31,6 +31,9 @@ from vllm_ascend.ascend_config import FinegrainedTPConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
+    mxfp_hybrid_paged_cache_views,
+    mxfp_packet_size_bytes,
+    mxfp_paged_cache_views,
     mxfp_v_scale_cache_shape,
 )
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -3144,6 +3147,108 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
             returned["layer.0"][3][0, :, :, 0, :, 0].reshape(-1).tolist(),
             layers["layer.0"].v_cache_scale.tolist(),
         )
+
+
+class TestC8MXFPBlockCopy(unittest.TestCase):
+    """Prefix-cache CoW for the packet-packed layout.
+
+    The C8 caches are dim0-strided views, so copies must go through the
+    recorded raw regions: whole scheduler blocks at a time, int8 bytes.
+    A hybrid region copies one scheduler block's contiguous packets; dense
+    layers own exactly one packet per scheduler block; non-C8 sections
+    (recurrent states) keep their dim0 = scheduler block copies.
+    """
+
+    NUM_KV_HEADS = 1
+    HEAD_DIM = 64
+    KERNEL_BLOCK = 4
+
+    def _runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.kv_caches = []
+        runner._c8_mxfp_copy_regions = {}
+        runner._c8_mxfp_view_ptrs = set()
+        return runner
+
+    def _dense(self, runner, name, num_blocks):
+        packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        # Byte pattern names the (block, byte) source position uniquely.
+        raw = torch.arange(num_blocks * packet, dtype=torch.int32).remainder(251).to(torch.int8)
+        views = mxfp_paged_cache_views(
+            raw, num_blocks, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
+        )
+        runner.kv_cache_config = SimpleNamespace(num_blocks=num_blocks)
+        runner._record_c8_mxfp_raw_region(name, views, raw, num_blocks, scheduler_chunk=1)
+        runner.kv_caches.append(views)
+        return raw, packet
+
+    def _copies(self, *pairs):
+        return [SimpleNamespace(src_block_id=s, dst_block_id=d) for s, d in pairs]
+
+    def test_dense_copy_moves_whole_packets(self):
+        runner = self._runner()
+        raw, packet = self._dense(runner, "layer.0", num_blocks=4)
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks(self._copies((1, 3)))
+        # Block 3 now mirrors block 1 byte for byte; every other block kept.
+        self.assertTrue(torch.equal(raw[3 * packet : 4 * packet], before[1 * packet : 2 * packet]))
+        self.assertTrue(torch.equal(raw[: 3 * packet], before[: 3 * packet]))
+
+    def test_hybrid_region_copies_a_schedulers_contiguous_packets(self):
+        runner = self._runner()
+        chunk = 2  # scheduler block spans 2 kernel blocks (8:1 in production)
+        num_sched = 2
+        packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        payload = num_sched * chunk * packet
+        raw = torch.arange(9 + payload, dtype=torch.int32).remainder(251).to(torch.int8)
+        views = mxfp_hybrid_paged_cache_views(
+            raw, num_sched * chunk, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
+        )
+        runner.kv_cache_config = SimpleNamespace(num_blocks=num_sched)
+        runner._record_c8_mxfp_raw_region(
+            "attn.0", views, raw, num_sched * chunk, scheduler_chunk=chunk
+        )
+        runner.kv_caches.append(views)
+        before = raw.clone()
+
+        runner._copy_c8_mxfp_blocks(self._copies((0, 1)))
+        span = chunk * packet
+        self.assertTrue(torch.equal(raw[9 + span : 9 + 2 * span], before[9 : 9 + span]))
+        # The mamba front section is untouched by the attention copy.
+        self.assertTrue(torch.equal(raw[:9], before[:9]))
+
+    def test_recurrent_state_sections_copy_by_scheduler_block(self):
+        runner = self._runner()
+        self._dense(runner, "attn.0", num_blocks=3)
+        conv = torch.arange(3 * 5, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(3, 5)
+        ssm = torch.arange(3 * 7, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(3, 7)
+        runner.kv_caches.append([conv, ssm])
+
+        runner._copy_c8_mxfp_blocks(self._copies((0, 2)))
+        self.assertTrue(torch.equal(conv[2], conv[0]))
+        self.assertTrue(torch.equal(ssm[2], ssm[0]))
+        self.assertTrue(torch.equal(conv[1], torch.arange(5, 10, dtype=torch.int32).remainder(251).to(torch.uint8)))
+
+    def test_shared_raw_regions_are_copied_once(self):
+        runner = self._runner()
+        raw, packet = self._dense(runner, "attn.0", num_blocks=4)
+        # A second C8 layer of the same group shares the raw allocation;
+        # both entries alias the same region, which the data_ptr dedup
+        # must handle without double copies (idempotent here, but the
+        # second copy would be wasted work).
+        runner._record_c8_mxfp_raw_region("attn.1", runner.kv_caches[0], raw, 4, scheduler_chunk=1)
+        runner.kv_caches.append(runner.kv_caches[0])
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks(self._copies((0, 3)))
+        self.assertTrue(torch.equal(raw[3 * packet : 4 * packet], before[:packet]))
+
+    def test_no_copies_is_a_noop(self):
+        runner = self._runner()
+        raw, _ = self._dense(runner, "attn.0", num_blocks=2)
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks([])
+        self.assertTrue(torch.equal(raw, before))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -74,6 +74,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -125,9 +126,8 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     MXFP8_GROUP_SIZE,
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
-    mxfp_k_scale_cache_shape,
-    mxfp_v_scale_cache_shape,
-    split_hybrid_c8_mxfp_cache_buffer,
+    mxfp_hybrid_paged_cache_views,
+    mxfp_paged_cache_views,
 )
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -977,6 +977,20 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
+        if scheduler_output.kv_cache_block_copies and is_c8_mxfp_kv_quant(self.vllm_config):
+            # The packet-packed C8 caches are dim0-strided views the generic
+            # segmented copy cannot view(); take the per-region block copy
+            # (whole scheduler blocks, int8 bytes) and fold the zeroing of
+            # freshly allocated blocks in. Non-C8 sections (hybrid recurrent
+            # states) are handled by the same helper.
+            if scheduler_output.new_block_ids_to_zero:
+                self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._copy_c8_mxfp_blocks(scheduler_output.kv_cache_block_copies)
+            scheduler_output = replace(
+                scheduler_output,
+                new_block_ids_to_zero=[],
+                kv_cache_block_copies=[],
+            )
         if scheduler_output.kv_cache_block_copies:
             # The upstream helper assumes one block-major backing storage.
             # Ascend can pack multiple block-indexed segments (notably Mamba
@@ -4787,6 +4801,81 @@ class NPUModelRunner(GPUModelRunner):
             and is_c8_mxfp_kv_quant(self.vllm_config)
         )
 
+    def _record_c8_mxfp_raw_region(
+        self,
+        layer_name: str,
+        views: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        raw: torch.Tensor,
+        num_kernel_blocks: int,
+        scheduler_chunk: int,
+    ) -> None:
+        """Remember a C8 layer's raw copy region for block-granularity copies.
+
+        The packet-packed caches are dim0-strided views, which the generic
+        per-section copy path cannot ``view()``. Block-granularity copies
+        (prefix-cache CoW) must instead copy whole scheduler blocks of the
+        underlying raw region: dense layers own exactly one packet per
+        scheduler block; a hybrid attention region owns its
+        ``scheduler_chunk`` packets contiguously per scheduler block. The
+        region start is the K view's storage offset (K sits at the packet
+        head); the dim0 stride is the packet size.
+        """
+        packet_size = views[0].stride(0)
+        scheduler_span = packet_size * scheduler_chunk
+        num_scheduler_blocks = num_kernel_blocks // scheduler_chunk
+        self._c8_mxfp_copy_regions[layer_name] = (
+            raw,
+            views[0].storage_offset(),
+            num_scheduler_blocks,
+            scheduler_span,
+        )
+        # The views alias the raw region; the per-entry dim0 copy below must
+        # skip them (their dim0 counts kernel blocks, not scheduler blocks).
+        self._c8_mxfp_view_ptrs.update(view.data_ptr() for view in views)
+
+    def _copy_c8_mxfp_blocks(self, block_copies: Sequence["KVCacheBlockCopy"]) -> None:
+        """Prefix-cache CoW for C8-MXFP deployments, packet-packed form.
+
+        Every C8 cache is a dim0-strided view (dim0 = kernel block), which
+        the generic segmented copy cannot express. Copy each C8 region's
+        whole scheduler blocks from the raw bytes instead -- one
+        ``index_select``/``index_copy_`` per region over int8 bytes covers
+        K, V and both scale caches in a single copy and never touches the
+        FP8 aclnnIndex restriction. Non-C8 entries of the same deployment
+        (e.g. hybrid recurrent states) keep dim0 = scheduler block and are
+        copied per tensor.
+        """
+        if not block_copies:
+            return
+        ids = torch.tensor(
+            [(copy.src_block_id, copy.dst_block_id) for copy in block_copies],
+            dtype=torch.long,
+            device=self.device,
+        )
+        src_ids, dst_ids = ids.unbind(dim=1)
+        seen_ptrs: set[int] = set()
+        for raw, offset, region_blocks, span in self._c8_mxfp_copy_regions.values():
+            ptr = raw.data_ptr() + offset
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            blocks = raw[offset : offset + region_blocks * span].view(region_blocks, span)
+            blocks.index_copy_(0, dst_ids, torch.index_select(blocks, 0, src_ids))
+        for layer_cache in self.kv_caches:
+            tensors = layer_cache if isinstance(layer_cache, (list, tuple)) else (layer_cache,)
+            for cache_tensor in tensors:
+                if cache_tensor is None or cache_tensor.dim() == 0:
+                    continue
+                ptr = cache_tensor.data_ptr()
+                if ptr in seen_ptrs or ptr in self._c8_mxfp_view_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                # dim0 = scheduler block; strided dim0 (padded hybrid pages)
+                # copies the padding along, exactly like the generic path.
+                cache_tensor.index_copy_(
+                    0, dst_ids, torch.index_select(cache_tensor, 0, src_ids)
+                )
+
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Broadcast every C8 MXFP layer's static V scale into its scale cache.
 
@@ -4819,6 +4908,10 @@ class NPUModelRunner(GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         allocation_context = kv_cache_allocation_context or nullcontext()
+        # Raw copy regions of the packet-packed C8 caches, filled by
+        # _reshape_kv_cache_tensors for prefix-cache CoW.
+        self._c8_mxfp_copy_regions: dict[str, tuple[torch.Tensor, int, int, int]] = {}
+        self._c8_mxfp_view_ptrs: set[int] = set()
         with allocation_context:
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
@@ -5300,8 +5393,11 @@ class NPUModelRunner(GPUModelRunner):
                             )
                         elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
                             # The packed spec head_size carries the E8M0 scale
-                            # bytes; split the page budget into four raw
-                            # payloads: K, V, K-scale, V-scale.
+                            # bytes; the page budget splits into four raw
+                            # payloads: K, V, K-scale, V-scale. The allocation
+                            # below packs all four into one packet-packed
+                            # buffer (per-kernel-block [K|Ks|V|Vs] packets),
+                            # so only the section sizes matter here.
                             ori_k_dim = k_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
                             ori_v_dim = v_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
                             kv_head_dim_list = [
@@ -5343,6 +5439,18 @@ class NPUModelRunner(GPUModelRunner):
                     # private (k, v) so block indices don't collide across layers.
                     for layer_name_inner in allocation_layers:
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                            if self._is_c8_mxfp_kv_cache(current_kv_cache_spec) and not current_sparse_sfa_c8:
+                                # Per-layer private packet-packed buffer:
+                                # one [K | K_scale | V | V_scale] packet per
+                                # kernel block, same region contract as the
+                                # generic (k, v) pair. One raw allocation also
+                                # halves the Mooncake/ADXL registration count.
+                                assert k_scale_tensor_size is not None and v_scale_tensor_size is not None
+                                kv_cache_raw_tensors[layer_name_inner] = self._allocate_int8_cache_tensor(
+                                    k_tensor_size + v_tensor_size + k_scale_tensor_size + v_scale_tensor_size,
+                                    alignment,
+                                )
+                                continue
                             k_tensor = self._allocate_int8_cache_tensor(
                                 k_tensor_size,
                                 alignment,
@@ -5355,22 +5463,6 @@ class NPUModelRunner(GPUModelRunner):
                                 )
                             if current_sparse_sfa_c8:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
-                            elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
-                                # Per-layer private 4-tuple, same region
-                                # contract as the generic (k, v) pair.
-                                assert v_tensor is not None
-                                k_scale_tensor = self._allocate_int8_cache_tensor(
-                                    k_scale_tensor_size, alignment
-                                )
-                                v_scale_tensor = self._allocate_int8_cache_tensor(
-                                    v_scale_tensor_size, alignment
-                                )
-                                kv_cache_raw_tensors[layer_name_inner] = (
-                                    k_tensor,
-                                    v_tensor,
-                                    k_scale_tensor,
-                                    v_scale_tensor,
-                                )
                             else:
                                 assert v_tensor is not None
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
@@ -5709,15 +5801,12 @@ class NPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = k_cache
                         continue  # Skip the rest of the AttentionSpec handling
                     elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
-                        raw_k_tensor, raw_v_tensor, raw_k_scale_tensor, raw_v_scale_tensor = kv_cache_raw_tensors[
-                            layer_name
-                        ]
-                        sum_page_size_bytes = (
-                            raw_k_tensor.numel()
-                            + raw_v_tensor.numel()
-                            + raw_k_scale_tensor.numel()
-                            + raw_v_scale_tensor.numel()
-                        )
+                        # One packet-packed raw allocation per layer
+                        # ([K | K_scale | V | V_scale] packets).
+                        raw_k_tensor = kv_cache_raw_tensors[layer_name]
+                        assert isinstance(raw_k_tensor, torch.Tensor)
+                        raw_v_tensor = None
+                        sum_page_size_bytes = raw_k_tensor.numel()
                     else:
                         raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
                             layer_name
@@ -5818,21 +5907,52 @@ class NPUModelRunner(GPUModelRunner):
                                 raw_k_tensor = raw_k_tensor[:nope_size]
                                 raw_v_tensor = raw_v_tensor[:rope_size]
                     if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        # Packet-packed strided views: one [K | K_scale | V |
+                        # V_scale] packet per kernel block, every cache a
+                        # dim0-strided view (dim0 = kernel block, stride =
+                        # packet size). The views are final -- scatter and
+                        # QFA consume them as-is, so skip the generic
+                        # per-section reshape below.
+                        # kv_cache_shape = (2, kernel_blocks, kernel_bs, N, packed_head)
+                        num_kernel_blocks = kv_cache_shape[1]
+                        kernel_block_size = kv_cache_shape[2]
+                        num_kv_heads_c8 = kv_cache_shape[3]
                         # Use the unpacked head_dim; the spec head_size still
                         # carries the packed scale bytes.
-                        k_shape = (*kv_cache_shape[1:-1], self.model_config.hf_text_config.head_dim)
-                        v_shape = k_shape
+                        head_dim = self.model_config.hf_text_config.head_dim
                         if raw_kv_is_combined:
-                            (
+                            # Hybrid shared buffer: attention packets sit at
+                            # the end; one scheduler block owns its 8 packets
+                            # contiguously, so page-granularity copies stay
+                            # correct.
+                            k_cache, v_cache, k_scale_cache, v_scale_cache = mxfp_hybrid_paged_cache_views(
                                 raw_k_tensor,
-                                raw_v_tensor,
-                                raw_k_scale_tensor,
-                                raw_v_scale_tensor,
-                            ) = split_hybrid_c8_mxfp_cache_buffer(
-                                raw_k_tensor,
-                                k_shape,
-                                v_shape,
+                                num_kernel_blocks,
+                                num_kv_heads_c8,
+                                head_dim,
+                                head_dim,
+                                kernel_block_size,
                             )
+                        else:
+                            k_cache, v_cache, k_scale_cache, v_scale_cache = mxfp_paged_cache_views(
+                                raw_k_tensor,
+                                num_kernel_blocks,
+                                num_kv_heads_c8,
+                                head_dim,
+                                head_dim,
+                                kernel_block_size,
+                            )
+                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
+                        # scheduler_chunk: packets per scheduler block (dense
+                        # 1:1; hybrid = spec block / kernel block).
+                        self._record_c8_mxfp_raw_region(
+                            layer_name,
+                            (k_cache, v_cache, k_scale_cache, v_scale_cache),
+                            raw_k_tensor,
+                            num_kernel_blocks,
+                            max(current_kv_cache_spec.block_size // kernel_block_size, 1),
+                        )
+                        continue
                     elif not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
                         k_shape = kv_cache_shape[1:]
                         if hasattr(current_kv_cache_spec, "head_size_v"):
@@ -5881,29 +6001,6 @@ class NPUModelRunner(GPUModelRunner):
 
                     if current_sparse_sfa_c8:
                         kv_caches[layer_name] = (k_cache,)
-                    elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
-                        # PA_NZ: the scale caches are allocated directly in
-                        # the 6-D NZ shapes QFA reads (layout_kv=PA_NZ), so
-                        # no layer transposes anything at attention time.
-                        # The K/V caches keep the natural 4-D storage; the
-                        # NZ 5-D view is taken at the operator boundary.
-                        k_scale_cache = raw_k_scale_tensor.view(torch.uint8).view(
-                            mxfp_k_scale_cache_shape(
-                                k_shape[0],
-                                k_shape[1],
-                                k_shape[2],
-                                k_shape[3],
-                            )
-                        )
-                        v_scale_cache = raw_v_scale_tensor.view(torch.uint8).view(
-                            mxfp_v_scale_cache_shape(
-                                v_shape[0],
-                                v_shape[1],
-                                v_shape[2],
-                                v_shape[3],
-                            )
-                        )
-                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
                     else:
                         assert v_cache is not None
                         kv_caches[layer_name] = (k_cache, v_cache)
