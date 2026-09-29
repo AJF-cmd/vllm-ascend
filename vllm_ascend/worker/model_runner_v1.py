@@ -4890,6 +4890,16 @@ class NPUModelRunner(GPUModelRunner):
             if not isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
                 continue
             fill_mxfp_v_scale_cache(layer.v_cache_scale, kv_cache[3])
+            vs = kv_cache[3]
+            nonzero = int((vs != 0).sum())
+            logger.warning(
+                "[C8DBG] fill %s: nonzero=%d/%d v_scale=[%d..%d]",
+                layer_name,
+                nonzero,
+                vs.numel(),
+                int(layer.v_cache_scale.min()),
+                int(layer.v_cache_scale.max()),
+            )
 
     def initialize_kv_cache_tensors(
         self,
@@ -5943,6 +5953,23 @@ class NPUModelRunner(GPUModelRunner):
                                 kernel_block_size,
                             )
                         kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
+                        logger.warning(
+                            "[C8DBG] %s nb=%d kbs=%d n=%d d=%d raw=%d "
+                            "k_shape=%s k_stride0=%d k_off=%d "
+                            "vs_shape=%s vs_stride0=%d vs_off=%d",
+                            layer_name,
+                            num_kernel_blocks,
+                            kernel_block_size,
+                            num_kv_heads_c8,
+                            head_dim,
+                            raw_k_tensor.numel(),
+                            tuple(k_cache.shape),
+                            k_cache.stride(0),
+                            k_cache.storage_offset(),
+                            tuple(v_scale_cache.shape),
+                            v_scale_cache.stride(0),
+                            v_scale_cache.storage_offset(),
+                        )
                         # scheduler_chunk: packets per scheduler block (dense
                         # 1:1; hybrid = spec block / kernel block).
                         self._record_c8_mxfp_raw_region(
