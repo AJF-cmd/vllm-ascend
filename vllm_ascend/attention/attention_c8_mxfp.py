@@ -721,14 +721,18 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
         # Dump only the crossing case (kv beyond the first scheduler
-        # block) -- the shape that fails on device.
+        # block) -- the shape that fails on device. The first two crossings
+        # (typically the prefill chunk and the first decode step) go to
+        # separate files for offline replay.
         crossing = int(seqused_kv[0]) > 3072
-        if crossing and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False):
-            AscendC8MXFPAttentionBackendImpl._c8dbg_class_logged = True
+        _dump_idx = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_dump_idx", 0)
+        if crossing and _dump_idx < 2:
+            AscendC8MXFPAttentionBackendImpl._c8dbg_dump_idx = _dump_idx + 1
             logger.warning(
-                "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
+                "[C8DBG2] #%d k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
                 "layout_q_descale=%s mask=%d msq=%d "
                 "bt0=%s cu_q=%s seq_kv=%s",
+                _dump_idx,
                 key.data_ptr(),
                 key.stride(0),
                 value_scale.data_ptr(),
@@ -778,8 +782,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 "num_kv_heads": self.num_kv_heads,
                 "head_size": self.head_size,
             }
-            torch.save(dump, "/tmp/c8dbg_qfa_dump.pt")
-            logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump.pt", blocks)
+            torch.save(dump, f"/tmp/c8dbg_qfa_dump{_dump_idx}.pt")
+            logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump%d.pt", blocks, _dump_idx)
+            self._c8dbg_dump_idx = _dump_idx
         from cann_ops_transformer.ops import quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
@@ -839,12 +844,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             )
         if (
             int(seqused_kv[0]) > 3072
-            and getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False)
-            and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_out_dumped", False)
+            and getattr(self, "_c8dbg_dump_idx", None) is not None
         ):
-            AscendC8MXFPAttentionBackendImpl._c8dbg_out_dumped = True
-            torch.save(attn_output.float().cpu(), "/tmp/c8dbg_qfa_out.pt")
-            logger.warning("[C8DBG3] dumped strided-run output to /tmp/c8dbg_qfa_out.pt")
+            torch.save(attn_output.float().cpu(), f"/tmp/c8dbg_qfa_out{self._c8dbg_dump_idx}.pt")
+            logger.warning(
+                "[C8DBG3] dumped strided-run output to /tmp/c8dbg_qfa_out%d.pt",
+                self._c8dbg_dump_idx,
+            )
+            self._c8dbg_dump_idx = None
         output[:num_tokens] = attn_output
         return output
 
