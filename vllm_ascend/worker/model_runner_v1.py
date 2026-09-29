@@ -4900,23 +4900,6 @@ class NPUModelRunner(GPUModelRunner):
             if not isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
                 continue
             fill_mxfp_v_scale_cache(layer.v_cache_scale, kv_cache[3])
-            vs = kv_cache[3]
-            nonzero = int((vs != 0).sum())
-            logger.warning(
-                "[C8DBG] fill %s: nonzero=%d/%d v_scale=[%d..%d]",
-                layer_name,
-                nonzero,
-                vs.numel(),
-                int(layer.v_cache_scale.min()),
-                int(layer.v_cache_scale.max()),
-            )
-            if not getattr(NPUModelRunner, "_c8dbg_fill_sum_logged", False):
-                NPUModelRunner._c8dbg_fill_sum_logged = True
-                logger.warning(
-                    "[C8DBGF] vs[6]+vs[7] sum right after fill = %d (healthy ~%.0f)",
-                    int(vs[6].view(torch.uint8).sum()) + int(vs[7].view(torch.uint8).sum()),
-                    2 * vs[0].numel() * 121.0,
-                )
 
     def initialize_kv_cache_tensors(
         self,
