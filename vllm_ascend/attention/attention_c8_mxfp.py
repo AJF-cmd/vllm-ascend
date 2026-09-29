@@ -770,6 +770,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # cann_ops_transformer delivery signature (verified on-device): the
         # allocating wrapper is capture-safe under npugraph_ex (ops-transformer
         # golden tests capture exactly this call, GRAPH_PATH=7).
+        _vs = kv_cache[3]
+        _cnt = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_q_count", 0)
+        _dbg_q = _cnt < 8
+        if _dbg_q:
+            AscendC8MXFPAttentionBackendImpl._c8dbg_q_count = _cnt + 1
+            logger.warning(
+                "[C8DBGQ] #%d before QFA: vs_sum=%d",
+                _cnt,
+                int(_vs[6].view(torch.uint8).sum()) + int(_vs[7].view(torch.uint8).sum()),
+            )
         result = quant_flash_attn(
             quant_query,
             key,
@@ -805,6 +815,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if _dbg_q:
+            logger.warning(
+                "[C8DBGQ] #%d after  QFA: vs_sum=%d",
+                _cnt,
+                int(_vs[6].view(torch.uint8).sum()) + int(_vs[7].view(torch.uint8).sum()),
+            )
         if (
             getattr(self, "_c8dbg_logged", False)
             and getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False)
