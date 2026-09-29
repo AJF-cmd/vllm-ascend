@@ -4980,6 +4980,20 @@ class NPUModelRunner(GPUModelRunner):
                         _found = True
             if not _found:
                 logger.warning("[C8DBG6] no cache overlap (%d leaves)", len(leaves))
+            _sample = 0
+            for _ln, _c in kv_caches.items():
+                if _sample >= 4:
+                    break
+                _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
+                for _t in _ts:
+                    if _t is None or _t.dim() == 0:
+                        continue
+                    logger.warning(
+                        "[C8DBG9] %s shape=%s dtype=%s ptr=%d bytes=%d",
+                        _ln, tuple(_t.shape), _t.dtype, _t.data_ptr(),
+                        _t.numel() * _t.element_size(),
+                    )
+                _sample += 1
             _seen_raw = set()
             for _ln, _raw in kv_cache_raw_tensors.items():
                 _ts = _raw if isinstance(_raw, (list, tuple)) else (_raw,)
