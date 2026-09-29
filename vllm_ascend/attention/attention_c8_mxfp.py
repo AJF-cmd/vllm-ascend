@@ -28,6 +28,7 @@ shared by the backend and the model runner.
 import torch
 import torch_npu
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
@@ -705,6 +706,26 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_scale = key_scale.view(torch.float8_e8m0fnu)
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
+        if not getattr(self, "_c8dbg_logged", False):
+            self._c8dbg_logged = True
+            logger.warning(
+                "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
+                "vs_head=%s layout_q_descale=%s mask=%d msq=%d "
+                "bt0=%s cu_q=%s seq_kv=%s",
+                key.data_ptr(),
+                key.stride(0),
+                value_scale.data_ptr(),
+                value_scale.stride(0),
+                value_scale.reshape(-1)[:8].tolist(),
+                layout_q_descale,
+                mask_mode,
+                max_seqlen_q,
+                attn_metadata.block_tables[0][:4].tolist()
+                if attn_metadata.block_tables is not None
+                else None,
+                cu_seqlens_q.tolist(),
+                seqused_kv.tolist(),
+            )
         from cann_ops_transformer.ops import quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
