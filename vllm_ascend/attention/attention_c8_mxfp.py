@@ -706,68 +706,66 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_scale = key_scale.view(torch.float8_e8m0fnu)
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
-        if not getattr(self, "_c8dbg_logged", False):
-            self._c8dbg_logged = True
-            # Dump only the crossing case (kv beyond the first scheduler
-            # block) -- the shape that fails on device.
-            crossing = int(seqused_kv[0]) > 3072
-            if crossing and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False):
-                AscendC8MXFPAttentionBackendImpl._c8dbg_class_logged = True
-                logger.warning(
-                    "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
-                    "layout_q_descale=%s mask=%d msq=%d "
-                    "bt0=%s cu_q=%s seq_kv=%s",
-                    key.data_ptr(),
-                    key.stride(0),
-                    value_scale.data_ptr(),
-                    value_scale.stride(0),
-                    layout_q_descale,
-                    mask_mode,
-                    max_seqlen_q,
-                    attn_metadata.block_tables[0][:4].tolist()
-                    if attn_metadata.block_tables is not None
-                    else None,
-                    cu_seqlens_q.tolist(),
-                    seqused_kv.tolist(),
-                )
-                # Dump the blocks the block table touches, one contiguous block
-                # at a time (whole-view materialization trips the NPU as_strided
-                # range check at this extent), plus the query side. Offline the
-                # same inputs are replayed against a dense layout. First layer
-                # only: later layers see NaN inputs cascading from layer 1.
-                blocks = sorted(
-                    {
-                        int(b)
-                        for row in attn_metadata.block_tables.tolist()
-                        for b in row
-                        if b >= 0
-                    }
-                )[:8]
-                self._c8dbg_blocks = blocks
-                dump = {
-                    "blocks": blocks,
-                    "k": [key[b].view(torch.uint8).cpu() for b in blocks],
-                    "v": [value[b].view(torch.uint8).cpu() for b in blocks],
-                    "ks": [key_scale[b].view(torch.uint8).cpu() for b in blocks],
-                    "vs": [value_scale[b].view(torch.uint8).cpu() for b in blocks],
-                    "q": quant_query.view(torch.uint8).cpu(),
-                    "q_scale": query_scale.view(torch.uint8).cpu(),
-                    "mask": self._qfa_int8_mask(attn_metadata).cpu()
-                    if mask_mode != QFA_MASK_MODE_NO_MASK
-                    else None,
-                    "bt": attn_metadata.block_tables.cpu(),
-                    "cu_q": cu_seqlens_q.cpu(),
-                    "seq_kv": seqused_kv.cpu(),
-                    "mask_mode": mask_mode,
-                    "max_seqlen_q": max_seqlen_q,
-                    "layout_q_descale": layout_q_descale,
-                    "softmax_scale": self.scale,
-                    "num_heads": self.num_heads,
-                    "num_kv_heads": self.num_kv_heads,
-                    "head_size": self.head_size,
+        # Dump only the crossing case (kv beyond the first scheduler
+        # block) -- the shape that fails on device.
+        crossing = int(seqused_kv[0]) > 3072
+        if crossing and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False):
+            AscendC8MXFPAttentionBackendImpl._c8dbg_class_logged = True
+            logger.warning(
+                "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
+                "layout_q_descale=%s mask=%d msq=%d "
+                "bt0=%s cu_q=%s seq_kv=%s",
+                key.data_ptr(),
+                key.stride(0),
+                value_scale.data_ptr(),
+                value_scale.stride(0),
+                layout_q_descale,
+                mask_mode,
+                max_seqlen_q,
+                attn_metadata.block_tables[0][:4].tolist()
+                if attn_metadata.block_tables is not None
+                else None,
+                cu_seqlens_q.tolist(),
+                seqused_kv.tolist(),
+            )
+            # Dump the blocks the block table touches, one contiguous block
+            # at a time (whole-view materialization trips the NPU as_strided
+            # range check at this extent), plus the query side. Offline the
+            # same inputs are replayed against a dense layout. First crossing
+            # layer only: later layers see NaN inputs cascading.
+            blocks = sorted(
+                {
+                    int(b)
+                    for row in attn_metadata.block_tables.tolist()
+                    for b in row
+                    if b >= 0
                 }
-                torch.save(dump, "/tmp/c8dbg_qfa_dump.pt")
-                logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump.pt", blocks)
+            )[:8]
+            self._c8dbg_blocks = blocks
+            dump = {
+                "blocks": blocks,
+                "k": [key[b].view(torch.uint8).cpu() for b in blocks],
+                "v": [value[b].view(torch.uint8).cpu() for b in blocks],
+                "ks": [key_scale[b].view(torch.uint8).cpu() for b in blocks],
+                "vs": [value_scale[b].view(torch.uint8).cpu() for b in blocks],
+                "q": quant_query.view(torch.uint8).cpu(),
+                "q_scale": query_scale.view(torch.uint8).cpu(),
+                "mask": self._qfa_int8_mask(attn_metadata).cpu()
+                if mask_mode != QFA_MASK_MODE_NO_MASK
+                else None,
+                "bt": attn_metadata.block_tables.cpu(),
+                "cu_q": cu_seqlens_q.cpu(),
+                "seq_kv": seqused_kv.cpu(),
+                "mask_mode": mask_mode,
+                "max_seqlen_q": max_seqlen_q,
+                "layout_q_descale": layout_q_descale,
+                "softmax_scale": self.scale,
+                "num_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_size": self.head_size,
+            }
+            torch.save(dump, "/tmp/c8dbg_qfa_dump.pt")
+            logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump.pt", blocks)
         from cann_ops_transformer.ops import quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
