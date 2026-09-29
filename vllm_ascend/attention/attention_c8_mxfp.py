@@ -771,14 +771,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # allocating wrapper is capture-safe under npugraph_ex (ops-transformer
         # golden tests capture exactly this call, GRAPH_PATH=7).
         _vs = kv_cache[3]
+        _vsb = int(attn_metadata.slot_mapping[0]) // 512 if attn_metadata.slot_mapping is not None else 0
         _cnt = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_q_count", 0)
         _dbg_q = _cnt < 8
         if _dbg_q:
             AscendC8MXFPAttentionBackendImpl._c8dbg_q_count = _cnt + 1
             logger.warning(
-                "[C8DBGQ] #%d before QFA: vs_sum=%d",
-                _cnt,
-                int(_vs[6].view(torch.uint8).sum()) + int(_vs[7].view(torch.uint8).sum()),
+                "[C8DBGQ] #%d before QFA: vs[%d]+vs[%d] sum=%d",
+                _cnt, _vsb, _vsb + 1,
+                int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
             )
         result = quant_flash_attn(
             quant_query,
@@ -817,9 +818,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         if _dbg_q:
             logger.warning(
-                "[C8DBGQ] #%d after  QFA: vs_sum=%d",
-                _cnt,
-                int(_vs[6].view(torch.uint8).sum()) + int(_vs[7].view(torch.uint8).sum()),
+                "[C8DBGQ] #%d after  QFA: vs[%d]+vs[%d] sum=%d",
+                _cnt, _vsb, _vsb + 1,
+                int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
             )
         if (
             getattr(self, "_c8dbg_logged", False)
@@ -1023,17 +1024,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             dst_type=torch.float8_e4m3fn,
         )
 
-        if not getattr(self, "_c8dbg0_logged", False):
-            self._c8dbg0_logged = True
+        _gcnt = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_g_count", 0)
+        if _gcnt < 40:
+            AscendC8MXFPAttentionBackendImpl._c8dbg_g_count = _gcnt + 1
             n = attn_metadata.num_actual_tokens
             logger.warning(
-                "[C8DBG0] q_in_nz=%d/%d q_in_nan=%d q_contig=%s q_stride=%s "
-                "q_out_nz=%d/%d q_scale_max=%d",
-                int((query[:n] != 0).sum()),
-                n * query.shape[1] * query.shape[2],
+                "[C8DBG0] #%d q_in_nan=%d q_out_nz=%d/%d q_scale_max=%d",
+                _gcnt,
                 int(torch.isnan(query[:n]).sum()),
-                query.is_contiguous(),
-                tuple(query.stride()),
                 int((query_mxfp8.view(torch.uint8) != 0).sum()),
                 query_mxfp8.numel(),
                 int(query_scale.view(torch.uint8).max()),
@@ -1047,8 +1045,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key[: attn_metadata.num_actual_tokens],
                 dst_type=torch.float8_e4m3fn,
             )
-            if getattr(self, "_c8dbg0_logged", False) and not getattr(self, "_c8dbg0_k_logged", False):
-                self._c8dbg0_k_logged = True
+            if getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_g_count", 0) <= 1:
                 n = attn_metadata.num_actual_tokens
                 logger.warning(
                     "[C8DBG0k] k_out_nz=%d/%d k_scale_max=%d k_scale_nz=%d/%d",
