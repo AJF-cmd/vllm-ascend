@@ -4946,6 +4946,41 @@ class NPUModelRunner(GPUModelRunner):
         # Static V scales are written once, here, and never again.
         self._fill_c8_mxfp_v_scale_caches(kv_caches)
 
+        if not getattr(NPUModelRunner, "_c8dbg_overlap_logged", False):
+            NPUModelRunner._c8dbg_overlap_logged = True
+            leaves: list[tuple[int, int, str]] = []
+            for _ln, _c in kv_caches.items():
+                _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
+                for _t in _ts:
+                    if _t is None or _t.dim() == 0:
+                        continue
+                    _sz = _t.numel() * _t.element_size()
+                    leaves.append((_t.data_ptr(), _sz, _ln))
+            _found = False
+            for _i in range(len(leaves)):
+                _s1, _n1, _l1 = leaves[_i]
+                for _j in range(_i + 1, len(leaves)):
+                    _s2, _n2, _l2 = leaves[_j]
+                    if _s1 == _s2 and _n1 == _n2:
+                        continue
+                    _lo = max(_s1, _s2)
+                    _hi = min(_s1 + _n1, _s2 + _n2)
+                    if _lo < _hi:
+                        _tag = "SAME-LAYER" if _l1 == _l2 else "CROSS-LAYER"
+                        logger.warning(
+                            "[C8DBG6] OVERLAP %s %s [%d..%d) <-> %s [%d..%d)",
+                            _tag,
+                            _l1,
+                            _s1,
+                            _s1 + _n1,
+                            _l2,
+                            _s2,
+                            _s2 + _n2,
+                        )
+                        _found = True
+            if not _found:
+                logger.warning("[C8DBG6] no cache overlap (%d leaves)", len(leaves))
+
         if any(
             isinstance(self.compilation_config.static_forward_context.get(name), v41_cache_layer_type)
             for name in kv_caches
