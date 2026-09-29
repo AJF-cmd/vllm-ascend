@@ -710,13 +710,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self._c8dbg_logged = True
             logger.warning(
                 "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
-                "vs_head=%s layout_q_descale=%s mask=%d msq=%d "
+                "layout_q_descale=%s mask=%d msq=%d "
                 "bt0=%s cu_q=%s seq_kv=%s",
                 key.data_ptr(),
                 key.stride(0),
                 value_scale.data_ptr(),
                 value_scale.stride(0),
-                value_scale.reshape(-1)[:8].tolist(),
                 layout_q_descale,
                 mask_mode,
                 max_seqlen_q,
@@ -725,6 +724,51 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 else None,
                 cu_seqlens_q.tolist(),
                 seqused_kv.tolist(),
+            )
+            logger.warning(
+                "[C8DBG3] q_nz=%d/%d k_nz=%d/%d v_nz=%d/%d ks_nz=%d/%d vs_nz=%d/%d",
+                int((quant_query.view(torch.uint8) != 0).sum()),
+                quant_query.numel(),
+                int((key.view(torch.uint8) != 0).sum()),
+                key.numel(),
+                int((value.view(torch.uint8) != 0).sum()),
+                value.numel(),
+                int((key_scale.view(torch.uint8) != 0).sum()),
+                key_scale.numel(),
+                int((value_scale.view(torch.uint8) != 0).sum()),
+                value_scale.numel(),
+            )
+            torch.save(
+                {
+                    "q": quant_query.view(torch.uint8).cpu(),
+                    "q_scale": query_scale.view(torch.uint8).cpu(),
+                    "k": key.view(torch.uint8).cpu(),
+                    "k_shape": tuple(key.shape),
+                    "k_stride": tuple(key.stride()),
+                    "k_offset": key.storage_offset(),
+                    "v": value.view(torch.uint8).cpu(),
+                    "v_shape": tuple(value.shape),
+                    "v_stride": tuple(value.stride()),
+                    "v_offset": value.storage_offset(),
+                    "ks": key_scale.view(torch.uint8).cpu(),
+                    "ks_shape": tuple(key_scale.shape),
+                    "ks_stride": tuple(key_scale.stride()),
+                    "ks_offset": key_scale.storage_offset(),
+                    "vs": value_scale.view(torch.uint8).cpu(),
+                    "vs_shape": tuple(value_scale.shape),
+                    "vs_stride": tuple(value_scale.stride()),
+                    "vs_offset": value_scale.storage_offset(),
+                    "bt": attn_metadata.block_tables.cpu()
+                    if attn_metadata.block_tables is not None
+                    else None,
+                    "cu_q": cu_seqlens_q.cpu(),
+                    "seq_kv": seqused_kv.cpu(),
+                    "mask_mode": mask_mode,
+                    "max_seqlen_q": max_seqlen_q,
+                    "layout_q_descale": layout_q_descale,
+                    "softmax_scale": self.scale,
+                },
+                "/tmp/c8dbg_qfa_dump.pt",
             )
         from cann_ops_transformer.ops import quant_flash_attn
 
