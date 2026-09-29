@@ -977,7 +977,11 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
-        if scheduler_output.kv_cache_block_copies and is_c8_mxfp_kv_quant(self.vllm_config):
+        if (
+            scheduler_output.kv_cache_block_copies
+            and is_c8_mxfp_kv_quant(self.vllm_config)
+            and not getattr(self, "_c8dbg_disable_intercept", True)
+        ):
             # The packet-packed C8 caches are dim0-strided views the generic
             # segmented copy cannot view(); take the per-region block copy
             # (whole scheduler blocks, int8 bytes) and fold the zeroing of
