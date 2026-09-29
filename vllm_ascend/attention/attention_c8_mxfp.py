@@ -826,7 +826,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
             )
         if (
-            crossing
+            int(seqused_kv[0]) > 3072
             and getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False)
             and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_out_dumped", False)
         ):
