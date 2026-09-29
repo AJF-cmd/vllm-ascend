@@ -4943,7 +4943,7 @@ class NPUModelRunner(GPUModelRunner):
             for _ln, _c in kv_caches.items():
                 _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
                 for _t in _ts:
-                    if _t is None or _t.dim() == 0:
+                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
                         continue
                     _sz = _t.numel() * _t.element_size()
                     leaves.append((_t.data_ptr(), _sz, _ln))
@@ -4977,7 +4977,7 @@ class NPUModelRunner(GPUModelRunner):
                     break
                 _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
                 for _t in _ts:
-                    if _t is None or _t.dim() == 0:
+                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
                         continue
                     logger.warning(
                         "[C8DBG9] %s shape=%s dtype=%s ptr=%d bytes=%d",
@@ -4989,7 +4989,7 @@ class NPUModelRunner(GPUModelRunner):
             for _ln, _raw in kv_cache_raw_tensors.items():
                 _ts = _raw if isinstance(_raw, (list, tuple)) else (_raw,)
                 for _t in _ts:
-                    if _t is None or _t.dim() == 0:
+                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
                         continue
                     _key = (_t.data_ptr(), _t.numel())
                     if _key in _seen_raw:
