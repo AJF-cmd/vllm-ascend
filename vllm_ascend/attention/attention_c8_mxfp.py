@@ -984,6 +984,24 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             dst_type=torch.float8_e4m3fn,
         )
 
+        if not getattr(self, "_c8dbg0_logged", False):
+            self._c8dbg0_logged = True
+            n = attn_metadata.num_actual_tokens
+            logger.warning(
+                "[C8DBG0] q_in_nz=%d/%d q_out_nz=%d/%d q_scale_max=%d "
+                "k_in_nz=%d/%d k_out_nz=%d/%d k_scale_max=%d",
+                int((query[:n] != 0).sum()),
+                n * query.shape[1] * query.shape[2],
+                int((query_mxfp8.view(torch.uint8) != 0).sum()),
+                query_mxfp8.numel(),
+                int(query_scale.view(torch.uint8).max()),
+                int((key[:n] != 0).sum()) if key is not None else -1,
+                n * key.shape[1] * key.shape[2] if key is not None else -1,
+                -1,
+                -1,
+                -1,
+            )
+
         # KV-sharing consumer layers reuse another layer's cache; writing
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
@@ -992,6 +1010,17 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key[: attn_metadata.num_actual_tokens],
                 dst_type=torch.float8_e4m3fn,
             )
+            if getattr(self, "_c8dbg0_logged", False) and not getattr(self, "_c8dbg0_k_logged", False):
+                self._c8dbg0_k_logged = True
+                n = attn_metadata.num_actual_tokens
+                logger.warning(
+                    "[C8DBG0k] k_out_nz=%d/%d k_scale_max=%d k_scale_nz=%d/%d",
+                    int((key_mxfp8.view(torch.uint8) != 0).sum()),
+                    key_mxfp8.numel(),
+                    int(key_scale.view(torch.uint8).max()),
+                    int((key_scale.view(torch.uint8) != 0).sum()),
+                    key_scale.numel(),
+                )
 
             original_value_shape = value.shape
             value = value.view(original_value_shape[0], -1)
