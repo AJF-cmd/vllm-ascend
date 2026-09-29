@@ -725,51 +725,42 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 cu_seqlens_q.tolist(),
                 seqused_kv.tolist(),
             )
-            logger.warning(
-                "[C8DBG3] q_nz=%d/%d k_nz=%d/%d v_nz=%d/%d ks_nz=%d/%d vs_nz=%d/%d",
-                int((quant_query.view(torch.uint8) != 0).sum()),
-                quant_query.numel(),
-                int((key.view(torch.uint8) != 0).sum()),
-                key.numel(),
-                int((value.view(torch.uint8) != 0).sum()),
-                value.numel(),
-                int((key_scale.view(torch.uint8) != 0).sum()),
-                key_scale.numel(),
-                int((value_scale.view(torch.uint8) != 0).sum()),
-                value_scale.numel(),
-            )
-            torch.save(
+            # Dump the blocks the block table touches, one contiguous block
+            # at a time (whole-view materialization trips the NPU as_strided
+            # range check at this extent), plus the query side. Offline the
+            # same inputs are replayed against a dense layout.
+            blocks = sorted(
                 {
-                    "q": quant_query.view(torch.uint8).cpu(),
-                    "q_scale": query_scale.view(torch.uint8).cpu(),
-                    "k": key.view(torch.uint8).cpu(),
-                    "k_shape": tuple(key.shape),
-                    "k_stride": tuple(key.stride()),
-                    "k_offset": key.storage_offset(),
-                    "v": value.view(torch.uint8).cpu(),
-                    "v_shape": tuple(value.shape),
-                    "v_stride": tuple(value.stride()),
-                    "v_offset": value.storage_offset(),
-                    "ks": key_scale.view(torch.uint8).cpu(),
-                    "ks_shape": tuple(key_scale.shape),
-                    "ks_stride": tuple(key_scale.stride()),
-                    "ks_offset": key_scale.storage_offset(),
-                    "vs": value_scale.view(torch.uint8).cpu(),
-                    "vs_shape": tuple(value_scale.shape),
-                    "vs_stride": tuple(value_scale.stride()),
-                    "vs_offset": value_scale.storage_offset(),
-                    "bt": attn_metadata.block_tables.cpu()
-                    if attn_metadata.block_tables is not None
-                    else None,
-                    "cu_q": cu_seqlens_q.cpu(),
-                    "seq_kv": seqused_kv.cpu(),
-                    "mask_mode": mask_mode,
-                    "max_seqlen_q": max_seqlen_q,
-                    "layout_q_descale": layout_q_descale,
-                    "softmax_scale": self.scale,
-                },
-                "/tmp/c8dbg_qfa_dump.pt",
-            )
+                    int(b)
+                    for row in attn_metadata.block_tables.tolist()
+                    for b in row
+                    if b >= 0
+                }
+            )[:8]
+            self._c8dbg_blocks = blocks
+            dump = {
+                "blocks": blocks,
+                "k": [key[b].view(torch.uint8).cpu() for b in blocks],
+                "v": [value[b].view(torch.uint8).cpu() for b in blocks],
+                "ks": [key_scale[b].view(torch.uint8).cpu() for b in blocks],
+                "vs": [value_scale[b].view(torch.uint8).cpu() for b in blocks],
+                "q": quant_query.view(torch.uint8).cpu(),
+                "q_scale": query_scale.view(torch.uint8).cpu()
+                if query_scale.dtype == torch.uint8
+                else query_scale.view(torch.uint8).cpu(),
+                "bt": attn_metadata.block_tables.cpu(),
+                "cu_q": cu_seqlens_q.cpu(),
+                "seq_kv": seqused_kv.cpu(),
+                "mask_mode": mask_mode,
+                "max_seqlen_q": max_seqlen_q,
+                "layout_q_descale": layout_q_descale,
+                "softmax_scale": self.scale,
+                "num_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_size": self.head_size,
+            }
+            torch.save(dump, "/tmp/c8dbg_qfa_dump.pt")
+            logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump.pt", blocks)
         from cann_ops_transformer.ops import quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
@@ -810,6 +801,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if getattr(self, "_c8dbg_logged", False) and not getattr(self, "_c8dbg_out_dumped", False):
+            self._c8dbg_out_dumped = True
+            torch.save(attn_output.float().cpu(), "/tmp/c8dbg_qfa_out.pt")
+            logger.warning("[C8DBG3] dumped strided-run output to /tmp/c8dbg_qfa_out.pt")
         output[:num_tokens] = attn_output
         return output
 
