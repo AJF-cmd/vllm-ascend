@@ -1071,6 +1071,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
 
             self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
+            # Debug probe: mamba ssm overlays the payload front and clobbers
+            # the interleaved Vs sections; refilling here (after scatter,
+            # before QFA) restores them, isolating Vs corruption as the
+            # fatal path.
+            if getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_refill_vs", True):
+                fill_mxfp_v_scale_cache(layer.v_cache_scale, kv_cache[3])
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
