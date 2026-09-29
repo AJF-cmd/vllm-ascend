@@ -708,7 +708,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         query_scale = query_scale.view(torch.float8_e8m0fnu)
         if not getattr(self, "_c8dbg_logged", False):
             self._c8dbg_logged = True
-            if not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False):
+            # Dump only the crossing case (kv beyond the first scheduler
+            # block) -- the shape that fails on device.
+            crossing = int(seqused_kv[0]) > 3072
+            if crossing and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False):
                 AscendC8MXFPAttentionBackendImpl._c8dbg_class_logged = True
                 logger.warning(
                     "[C8DBG2] k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
@@ -823,7 +826,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
             )
         if (
-            getattr(self, "_c8dbg_logged", False)
+            crossing
             and getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_class_logged", False)
             and not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_out_dumped", False)
         ):
@@ -947,13 +950,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         def _vs_checksum():
             vs = kv_cache[3]
             b = int(slot_mapping[0]) // block_size if slot_mapping.numel() else 0
-            return int(vs[b].view(torch.uint8).sum()) + int(vs[b + 1].view(torch.uint8).sum())
+            blocks = sorted({int(x) // block_size for x in attn_metadata.block_tables.tolist()[0] if x >= 0} | {b})
+            return [int(vs[b_].view(torch.uint8).sum()) for b_ in blocks]
 
         _call_count = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_s_count", 0)
         dbg = _call_count < 20
         if dbg:
             AscendC8MXFPAttentionBackendImpl._c8dbg_s_count = _call_count + 1
-            logger.warning("[C8DBGS] #%d before scatter: vs_sum=%d", _call_count, _vs_checksum())
+            logger.warning("[C8DBGS] #%d before scatter: vs_sums=%s", _call_count, _vs_checksum())
         # Scatter the K/V payloads through the strided packet views; the
         # operator's tiling consumes the dim0 stride as the block stride.
         scatter_mxfp_pa_nz_kv_cache(
@@ -964,7 +968,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             slot_mapping,
         )
         if dbg:
-            logger.warning("[C8DBGS] #%d after  scatter: vs_sum=%d", _call_count, _vs_checksum())
+            logger.warning("[C8DBGS] #%d after  scatter: vs_sums=%s", _call_count, _vs_checksum())
 
         # Only K's scale is per-token; V's static scale is filled once at KV
         # cache setup by NPUModelRunner._fill_c8_mxfp_v_scale_caches.
@@ -975,7 +979,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
         )
         if dbg:
-            logger.warning("[C8DBGS] #%d after  ks put: vs_sum=%d", _call_count, _vs_checksum())
+            logger.warning("[C8DBGS] #%d after  ks put: vs_sums=%s", _call_count, _vs_checksum())
         notify_kv_cache_written()
 
     def forward(
