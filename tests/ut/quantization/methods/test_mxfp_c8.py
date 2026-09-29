@@ -87,7 +87,9 @@ class TestMXFPPagedCacheViews(TestBase):
     replaces.
     """
 
-    BLOCK_SIZE = 4
+    # The V-scale 6-D layout divides the block axis by 64, so the smallest
+    # legal kernel block is 64 (production uses 512).
+    BLOCK_SIZE = 64
     NUM_KV_HEADS = 2
     HEAD_DIM = 64
     NUM_BLOCKS = 3
@@ -242,7 +244,7 @@ class TestScatterMXFPPaNzKvCache(TestBase):
     validated on-device by the FIA C8 path, which makes this exact call.
     """
 
-    BLOCK_SIZE = 4
+    BLOCK_SIZE = 64
     NUM_KV_HEADS = 2
     HEAD_DIM = 64  # D//32 = 2 fragments
     NUM_BLOCKS = 2

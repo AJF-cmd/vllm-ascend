@@ -3161,7 +3161,7 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
 
     NUM_KV_HEADS = 1
     HEAD_DIM = 64
-    KERNEL_BLOCK = 4
+    KERNEL_BLOCK = 64
 
     def _runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
