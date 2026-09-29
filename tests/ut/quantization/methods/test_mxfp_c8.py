@@ -223,10 +223,11 @@ class TestMXFPPagedCacheViews(TestBase):
         # first packet starts after both the mamba states and the trailing
         # slack; writing through the views must touch neither region.
         self.assertEqual(k.storage_offset(), mamba_bytes + tail_slack)
+        # fill_(7) stores E4M3-encoded bytes, so count non-zero bytes.
         k[0].fill_(7)
         self.assertTrue(bool((raw[: mamba_bytes + tail_slack] == 0).all()))
         self.assertTrue(bool((raw[mamba_bytes + tail_slack + payload :] == 0).all()))
-        self.assertEqual(int((raw.view(torch.uint8) == 7).sum()), k[0].numel())
+        self.assertEqual(int((raw.view(torch.uint8) != 0).sum()), k[0].numel())
 
     def test_region_too_small_is_rejected(self):
         with self.assertRaises(ValueError):
