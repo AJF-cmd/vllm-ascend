@@ -926,6 +926,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_cache, value_cache = kv_cache[0], kv_cache[1]
         # 5-D PA_NZ packet-packed views: (kernel_blocks, N, D//32, Bs, 32).
         block_size = key_cache.shape[3]
+
+        def _vs_checksum():
+            vs = kv_cache[3]
+            b = int(slot_mapping[0]) // block_size if slot_mapping.numel() else 0
+            return int(vs[b].view(torch.uint8).sum()) + int(vs[b + 1].view(torch.uint8).sum())
+
+        dbg = not getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_scatter_logged", False)
+        if dbg:
+            AscendC8MXFPAttentionBackendImpl._c8dbg_scatter_logged = True
+            logger.warning("[C8DBGS] before scatter: vs_sum=%d", _vs_checksum())
         # Scatter the K/V payloads through the strided packet views; the
         # operator's tiling consumes the dim0 stride as the block stride.
         scatter_mxfp_pa_nz_kv_cache(
@@ -935,6 +945,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_cache,
             slot_mapping,
         )
+        if dbg:
+            logger.warning("[C8DBGS] after  scatter: vs_sum=%d", _vs_checksum())
 
         # Only K's scale is per-token; V's static scale is filled once at KV
         # cache setup by NPUModelRunner._fill_c8_mxfp_v_scale_caches.
@@ -944,6 +956,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             kv_cache[2],
             self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
         )
+        if dbg:
+            logger.warning("[C8DBGS] after  ks put: vs_sum=%d", _vs_checksum())
         notify_kv_cache_written()
 
     def forward(
