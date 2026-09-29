@@ -988,18 +988,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self._c8dbg0_logged = True
             n = attn_metadata.num_actual_tokens
             logger.warning(
-                "[C8DBG0] q_in_nz=%d/%d q_out_nz=%d/%d q_scale_max=%d "
-                "k_in_nz=%d/%d k_out_nz=%d/%d k_scale_max=%d",
+                "[C8DBG0] q_in_nz=%d/%d q_in_nan=%d q_contig=%s q_stride=%s "
+                "q_out_nz=%d/%d q_scale_max=%d",
                 int((query[:n] != 0).sum()),
                 n * query.shape[1] * query.shape[2],
+                int(torch.isnan(query[:n]).sum()),
+                query.is_contiguous(),
+                tuple(query.stride()),
                 int((query_mxfp8.view(torch.uint8) != 0).sum()),
                 query_mxfp8.numel(),
                 int(query_scale.view(torch.uint8).max()),
-                int((key[:n] != 0).sum()) if key is not None else -1,
-                n * key.shape[1] * key.shape[2] if key is not None else -1,
-                -1,
-                -1,
-                -1,
             )
 
         # KV-sharing consumer layers reuse another layer's cache; writing
