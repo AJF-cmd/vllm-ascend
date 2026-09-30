@@ -5962,9 +5962,9 @@ class NPUModelRunner(GPUModelRunner):
                                 head_dim,
                                 kernel_block_size,
                             )
-                         kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
-                         # scheduler_chunk: packets per scheduler block (dense
-                         # 1:1; hybrid = spec block / kernel block).
+                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
+                        # scheduler_chunk: packets per scheduler block (dense
+                        # 1:1; hybrid = spec block / kernel block).
                         self._record_c8_mxfp_raw_region(
                             layer_name,
                             (k_cache, v_cache, k_scale_cache, v_scale_cache),
