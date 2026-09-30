@@ -393,31 +393,48 @@ def mxfp_hybrid_paged_cache_views(
     v_dim: int,
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the packet-packed C8 MXFP views over a hybrid buffer's attention tail.
+    """Build the section-major C8 MXFP views over a hybrid buffer's attention tail.
 
-    Hybrid cache groups allocate one padded raw buffer shared by Mamba and
-    full-attention layers. Mamba state views start at the front of the
-    buffer; the attention payload sits at the end, packet-packed: one
-    ``[K | V]`` packet per kernel block laid out contiguously, followed by
-    the contiguous K-scale and V-scale segments. Every scheduler block
-    still owns one contiguous packet range (plus its scale slices), so
-    block-granularity CoW/transfer stay correct.
+    Hybrid cache groups share one padded raw buffer between Mamba and
+    full-attention layers. The overlay places the mamba SSM state over the
+    front of the attention payload, and the block-size alignment
+    (one SSM slot spans the same bytes as one scheduler block of K) makes
+    that overlay zone exactly as large as the whole K section. Keeping K
+    as the first section confines the overlay to K, which the per-step
+    scatter fully rewrites; V and both scale caches sit behind the K
+    section, outside the overlay zone. All four sections are stored
+    directly in their PA_NZ operator layouts (no boundary re-viewing), so
+    scatter and QFA consume the views as-is. Each section is contiguous,
+    so block-granularity CoW/transfer copy per section slice.
     """
-    packet_size = mxfp_packet_size_bytes(num_kv_heads, block_size, k_dim, v_dim)
-    k_scale_size = mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim)
-    v_scale_size = mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim)
-    payload_size = num_kernel_blocks * (packet_size + k_scale_size + v_scale_size)
+    section_sizes = [
+        num_kv_heads * block_size * k_dim,
+        num_kv_heads * block_size * v_dim,
+        mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim),
+        mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim),
+    ]
+    payload_size = num_kernel_blocks * sum(section_sizes)
     if raw_tensor.numel() < payload_size:
         raise ValueError(
             "C8_MXFP hybrid cache buffer is too small: "
             f"raw_numel={raw_tensor.numel()}, payload_numel={payload_size} "
-            f"({num_kernel_blocks} packets of {packet_size} plus the "
-            f"K-scale and V-scale segments)."
+            f"({num_kernel_blocks} blocks per section)."
         )
     region = raw_tensor[raw_tensor.numel() - payload_size :]
-    return mxfp_paged_cache_views(
-        region, num_kernel_blocks, num_kv_heads, k_dim, v_dim, block_size
+    shapes = (
+        (num_kernel_blocks, num_kv_heads, k_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
+        (num_kernel_blocks, num_kv_heads, v_dim // MXFP_KV_NZ_DIM_FRAG, block_size, MXFP_KV_NZ_DIM_FRAG),
+        mxfp_k_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, k_dim),
+        mxfp_v_scale_cache_shape(num_kernel_blocks, block_size, num_kv_heads, v_dim),
     )
+    dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8)
+    views = []
+    offset = 0
+    for size, shape, dtype in zip(section_sizes, shapes, dtypes):
+        section = region[offset : offset + num_kernel_blocks * size]
+        views.append(section.view(dtype).view(shape))
+        offset += num_kernel_blocks * size
+    return tuple(views)
 
 
 class AscendC8MXFPAttentionBackend(AscendAttentionBackend):

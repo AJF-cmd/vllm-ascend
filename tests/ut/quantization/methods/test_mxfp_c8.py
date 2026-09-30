@@ -226,21 +226,29 @@ class TestMXFPPagedCacheViews(TestBase):
 
     def test_hybrid_views_sit_at_the_tail_of_the_shared_buffer(self):
         mamba_bytes = 37  # arbitrary front section (conv/SSM states)
-        payload = self._payload_bytes()
+        k_sec = self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM
+        ks_sec = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
+        payload = self.NUM_BLOCKS * (k_sec + k_sec + ks_sec + ks_sec)
         tail_slack = 5
         raw = torch.zeros(mamba_bytes + payload + tail_slack, dtype=torch.int8)
         k, v, ks, vs = mxfp_hybrid_paged_cache_views(
             raw, self.NUM_BLOCKS, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.BLOCK_SIZE
         )
-        # The attention payload (packets + V-scale segment) is carved from
-        # the buffer's tail, so the first packet starts after both the
-        # mamba states and the trailing slack; writing through the views
-        # must touch neither region.
-        self.assertEqual(k.storage_offset(), mamba_bytes + tail_slack)
-        # fill_(7) stores E4M3-encoded bytes, so count non-zero bytes.
+        # Section-major layout: K heads the region (so the mamba SSM
+        # overlay, whose extent equals the whole K section, stays confined
+        # to K), every section contiguous, back to back.
+        region_start = mamba_bytes + tail_slack
+        self.assertEqual(k.storage_offset(), region_start)
+        self.assertTrue(k.is_contiguous() and v.is_contiguous())
+        self.assertEqual(v.storage_offset(), region_start + self.NUM_BLOCKS * k_sec)
+        self.assertEqual(ks.storage_offset(), v.storage_offset() + self.NUM_BLOCKS * k_sec)
+        self.assertEqual(vs.storage_offset(), ks.storage_offset() + self.NUM_BLOCKS * ks_sec)
+        # fill_(7) stores E4M3-encoded bytes, so count non-zero bytes;
+        # writing through the views must touch neither the mamba front nor
+        # the trailing slack.
         k[0].fill_(7)
-        self.assertTrue(bool((raw[: mamba_bytes + tail_slack] == 0).all()))
-        self.assertTrue(bool((raw[mamba_bytes + tail_slack + payload :] == 0).all()))
+        self.assertTrue(bool((raw[:region_start] == 0).all()))
+        self.assertTrue(bool((raw[region_start + payload :] == 0).all()))
         self.assertEqual(int((raw.view(torch.uint8) != 0).sum()), k[0].numel())
 
     def test_region_too_small_is_rejected(self):

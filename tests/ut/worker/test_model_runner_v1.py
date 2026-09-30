@@ -3221,10 +3221,10 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
         chunk = 2  # scheduler block spans 2 kernel blocks (8:1 in production)
         num_sched = 2
         num_kernel = num_sched * chunk
-        packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        # Section-major hybrid layout: four contiguous sections.
+        k_sec = self.NUM_KV_HEADS * self.KERNEL_BLOCK * self.HEAD_DIM
         k_scale = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
-        v_scale = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
-        payload = num_kernel * (packet + k_scale + v_scale)
+        payload = num_kernel * (k_sec + k_sec + k_scale + k_scale)
         raw = torch.arange(9 + payload, dtype=torch.int32).remainder(251).to(torch.int8)
         views = mxfp_hybrid_paged_cache_views(
             raw, num_kernel, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
@@ -3237,21 +3237,20 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
         before = raw.clone()
 
         runner._copy_c8_mxfp_blocks(self._copies((0, 1)))
-        span = chunk * packet
-        self.assertTrue(torch.equal(raw[9 + span : 9 + 2 * span], before[9 : 9 + span]))
+
+        def _assert_section(base, sec_bytes):
+            span = chunk * sec_bytes
+            self.assertTrue(
+                torch.equal(raw[base + span : base + 2 * span], before[base : base + span])
+            )
+
+        # Each section copies scheduler block 1 from scheduler block 0.
+        _assert_section(9, k_sec)  # K
+        _assert_section(9 + num_kernel * k_sec, k_sec)  # V
+        _assert_section(9 + 2 * num_kernel * k_sec, k_scale)  # K-scale
+        _assert_section(9 + 2 * num_kernel * k_sec + num_kernel * k_scale, k_scale)  # V-scale
         # The mamba front section is untouched by the attention copy.
         self.assertTrue(torch.equal(raw[:9], before[:9]))
-        # Scale segments: scheduler block 1 mirrors scheduler block 0.
-        ks_base = 9 + num_kernel * packet
-        ks_span = chunk * k_scale
-        self.assertTrue(
-            torch.equal(raw[ks_base + ks_span : ks_base + 2 * ks_span], before[ks_base : ks_base + ks_span])
-        )
-        vs_base = ks_base + num_kernel * k_scale
-        vs_span = chunk * v_scale
-        self.assertTrue(
-            torch.equal(raw[vs_base + vs_span : vs_base + 2 * vs_span], before[vs_base : vs_base + vs_span])
-        )
 
     def test_recurrent_state_sections_copy_by_scheduler_block(self):
         runner = self._runner()
