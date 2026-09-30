@@ -9,6 +9,8 @@ from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
+from vllm_ascend.utils import A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+
 
 def _get_sparse_index_kpool(model_config) -> int | None:
     """Return the active sparse index-kpool ratio, if configured."""
@@ -43,6 +45,26 @@ def _using_kv_store(vllm_config) -> bool:
     return False
 
 
+def _update_c8_mxfp_block_size(cache_config) -> None:
+    """Constrain scheduler blocks to whole C8_MXFP kernel blocks.
+
+    The C8 KV cache is addressed in 512-token kernel blocks, so the
+    scheduler block size must be a whole multiple of the kernel block.
+    Default to the kernel block when unset and reject explicit unsupported
+    values instead of silently rewriting them.
+    """
+    if cache_config.cache_dtype != "mxfp8":
+        return
+    if cache_config.block_size is None:
+        cache_config.block_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+    elif cache_config.block_size % A5_C8_MXFP_KV_CACHE_BLOCK_SIZE != 0:
+        raise ValueError(
+            "C8_MXFP requires --block-size to be a multiple of "
+            f"{A5_C8_MXFP_KV_CACHE_BLOCK_SIZE} (512-token kernel blocks), "
+            f"got {cache_config.block_size}."
+        )
+
+
 @classmethod
 def verify_and_update_config(cls, vllm_config) -> None:
     """
@@ -60,6 +82,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
+    _update_c8_mxfp_block_size(cache_config)
+
     index_kpool = _get_sparse_index_kpool(model_config)
     if index_kpool is not None:
         parallel_config = vllm_config.parallel_config

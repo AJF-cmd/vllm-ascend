@@ -29,6 +29,15 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_ascend.ascend_config import FinegrainedTPConfig
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.attention.attention_c8_mxfp import (
+    AscendC8MXFPAttentionBackendImpl,
+    mxfp_hybrid_paged_cache_views,
+    mxfp_k_scale_page_bytes,
+    mxfp_packet_size_bytes,
+    mxfp_paged_cache_views,
+    mxfp_v_scale_cache_shape,
+    mxfp_v_scale_page_bytes,
+)
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import (
@@ -1562,6 +1571,17 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             caches[draft][2].fill_(3)
             assert (caches[target][1] == 2).all()
             assert (caches[draft][0] == 0).all()
+
+    def test_c8_mxfp_cache_selection_excludes_mla(self):
+        runner = self._build_runner()
+        runner.vllm_config.cache_config.cache_dtype = "mxfp8"
+        for spec_type in (FullAttentionSpec, MLAAttentionSpec, AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec):
+            with self.subTest(spec_type=spec_type):
+                spec = spec_type(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn)
+                self.assertEqual(runner._is_c8_mxfp_kv_cache(spec), spec_type is FullAttentionSpec)
+        runner.vllm_config.cache_config.cache_dtype = "auto"
+        spec = FullAttentionSpec(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+        self.assertFalse(runner._is_c8_mxfp_kv_cache(spec))
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
@@ -3373,6 +3393,218 @@ class TestKVPPExecute(unittest.TestCase):
                 self.assertEqual(
                     events, ([("prepare", expected)] if computed is not None else []) + ["forward", "complete"]
                 )
+
+
+class TestC8MXFPVScaleCacheFill(unittest.TestCase):
+    """The static V scale is written at KV cache setup, not in forward.
+
+    Filling it lazily during attention meant the write could be recorded into
+    an ACL graph instead of executed, which left the draft model's V scale at
+    zero and collapsed MTP acceptance. Doing it here happens before any
+    capture, replay or request, so no execution order can skip it.
+    """
+
+    NUM_BLOCKS = 2
+    NUM_KV_HEADS = 2
+    BLOCK_SIZE = 128
+    HEAD_DIM = 64
+
+    def _runner(self, layers):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.compilation_config = SimpleNamespace(static_forward_context=layers)
+        return runner
+
+    def _c8_layer(self):
+        layer = SimpleNamespace(
+            v_cache_scale=torch.arange(self.NUM_KV_HEADS * self.HEAD_DIM, dtype=torch.int32)
+            .remainder(251)
+            .to(torch.uint8),
+            impl=object.__new__(AscendC8MXFPAttentionBackendImpl),
+        )
+        return layer
+
+    def _c8_cache(self):
+        v_scale = torch.zeros(
+            mxfp_v_scale_cache_shape(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM),
+            dtype=torch.uint8,
+        )
+        return (MagicMock(), MagicMock(), MagicMock(), v_scale)
+
+    def test_every_c8_mxfp_layer_is_filled(self):
+        layers = {f"layer.{i}": self._c8_layer() for i in range(3)}
+        kv_caches = {name: self._c8_cache() for name in layers}
+        self._runner(layers)._fill_c8_mxfp_v_scale_caches(kv_caches)
+        for name, layer in layers.items():
+            self.assertEqual(
+                kv_caches[name][3][0, :, :, 0, :, 0].reshape(-1).tolist(),
+                layer.v_cache_scale.tolist(),
+            )
+
+    def test_other_backends_are_left_alone(self):
+        # Non-C8 layers hand out plain (k, v) pairs; indexing them as a
+        # four-tuple would be the bug, so they must not be touched at all.
+        layers = {"plain": SimpleNamespace(impl=object())}
+        kv_caches = {"plain": (MagicMock(), MagicMock())}
+        self._runner(layers)._fill_c8_mxfp_v_scale_caches(kv_caches)
+
+    def test_a_layer_without_a_forward_context_entry_is_skipped(self):
+        self._runner({})._fill_c8_mxfp_v_scale_caches({"stray": (MagicMock(), MagicMock())})
+
+    def test_cache_setup_hands_back_a_filled_cache(self):
+        # The wiring, not just the helper: nothing downstream of
+        # initialize_kv_cache_tensors fills this cache, so if the call site
+        # ever goes away the scales are zero for the life of the process.
+        layers = {"layer.0": self._c8_layer()}
+        kv_caches = {"layer.0": self._c8_cache()}
+        runner = self._runner(layers)
+        runner.shared_kv_cache_layers = {}
+        runner.kv_caches = []
+        runner.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3"))
+        with (
+            patch.object(NPUModelRunner, "_allocate_kv_cache_tensors", return_value={}),
+            patch.object(NPUModelRunner, "_reshape_kv_cache_tensors", return_value=kv_caches),
+            patch("vllm.v1.worker.utils.bind_kv_cache"),
+        ):
+            returned = runner.initialize_kv_cache_tensors(MagicMock())
+        self.assertEqual(
+            returned["layer.0"][3][0, :, :, 0, :, 0].reshape(-1).tolist(),
+            layers["layer.0"].v_cache_scale.tolist(),
+        )
+
+
+class TestC8MXFPBlockCopy(unittest.TestCase):
+    """Prefix-cache CoW for the packet-packed layout.
+
+    The C8 caches are dim0-strided views, so copies must go through the
+    recorded raw regions: whole scheduler blocks at a time, int8 bytes.
+    A hybrid region copies one scheduler block's contiguous packets; dense
+    layers own exactly one packet per scheduler block; non-C8 sections
+    (recurrent states) keep their dim0 = scheduler block copies.
+    """
+
+    NUM_KV_HEADS = 1
+    HEAD_DIM = 64
+    KERNEL_BLOCK = 64
+
+    def _runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.kv_caches = []
+        runner._c8_mxfp_copy_regions = {}
+        runner._c8_mxfp_view_ptrs = set()
+        return runner
+
+    def _dense(self, runner, name, num_blocks):
+        packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        k_scale = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
+        v_scale = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
+        # Byte pattern names the (block, byte) source position uniquely.
+        raw = torch.arange(num_blocks * (packet + k_scale + v_scale), dtype=torch.int32).remainder(251).to(torch.int8)
+        views = mxfp_paged_cache_views(
+            raw, num_blocks, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
+        )
+        runner.kv_cache_config = SimpleNamespace(num_blocks=num_blocks)
+        runner._record_c8_mxfp_raw_region(name, views, raw, num_blocks, scheduler_chunk=1)
+        runner.kv_caches.append(views)
+        return raw, packet, k_scale, v_scale
+
+    def _copies(self, *pairs):
+        return [SimpleNamespace(src_block_id=s, dst_block_id=d) for s, d in pairs]
+
+    def test_dense_copy_moves_whole_packets(self):
+        runner = self._runner()
+        num_blocks = 4
+        raw, packet, k_scale, v_scale = self._dense(runner, "layer.0", num_blocks)
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks(self._copies((1, 3)))
+        # Packet region: block 3 now mirrors block 1 byte for byte; every
+        # other packet kept.
+        self.assertTrue(torch.equal(raw[3 * packet : 4 * packet], before[1 * packet : 2 * packet]))
+        self.assertTrue(torch.equal(raw[: 3 * packet], before[: 3 * packet]))
+        # Scale segments: block 3 mirrors block 1 in each of them.
+        ks_base = num_blocks * packet
+        self.assertTrue(
+            torch.equal(
+                raw[ks_base + 3 * k_scale : ks_base + 4 * k_scale],
+                before[ks_base + k_scale : ks_base + 2 * k_scale],
+            )
+        )
+        vs_base = ks_base + num_blocks * k_scale
+        self.assertTrue(
+            torch.equal(
+                raw[vs_base + 3 * v_scale : vs_base + 4 * v_scale],
+                before[vs_base + v_scale : vs_base + 2 * v_scale],
+            )
+        )
+
+    def test_hybrid_region_copies_a_schedulers_contiguous_packets(self):
+        runner = self._runner()
+        chunk = 2  # scheduler block spans 2 kernel blocks (8:1 in production)
+        num_sched = 2
+        num_kernel = num_sched * chunk
+        # Section-major hybrid layout: four contiguous sections.
+        k_sec = self.NUM_KV_HEADS * self.KERNEL_BLOCK * self.HEAD_DIM
+        k_scale = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
+        payload = num_kernel * (k_sec + k_sec + k_scale + k_scale)
+        raw = torch.arange(9 + payload, dtype=torch.int32).remainder(251).to(torch.int8)
+        views = mxfp_hybrid_paged_cache_views(
+            raw, num_kernel, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
+        )
+        runner.kv_cache_config = SimpleNamespace(num_blocks=num_sched)
+        runner._record_c8_mxfp_raw_region(
+            "attn.0", views, raw, num_kernel, scheduler_chunk=chunk
+        )
+        runner.kv_caches.append(views)
+        before = raw.clone()
+
+        runner._copy_c8_mxfp_blocks(self._copies((0, 1)))
+
+        def _assert_section(base, sec_bytes):
+            span = chunk * sec_bytes
+            self.assertTrue(
+                torch.equal(raw[base + span : base + 2 * span], before[base : base + span])
+            )
+
+        # Each section copies scheduler block 1 from scheduler block 0.
+        _assert_section(9, k_sec)  # K
+        _assert_section(9 + num_kernel * k_sec, k_sec)  # V
+        _assert_section(9 + 2 * num_kernel * k_sec, k_scale)  # K-scale
+        _assert_section(9 + 2 * num_kernel * k_sec + num_kernel * k_scale, k_scale)  # V-scale
+        # The mamba front section is untouched by the attention copy.
+        self.assertTrue(torch.equal(raw[:9], before[:9]))
+
+    def test_recurrent_state_sections_copy_by_scheduler_block(self):
+        runner = self._runner()
+        self._dense(runner, "attn.0", num_blocks=3)
+        conv = torch.arange(3 * 5, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(3, 5)
+        ssm = torch.arange(3 * 7, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(3, 7)
+        runner.kv_caches.append([conv, ssm])
+
+        runner._copy_c8_mxfp_blocks(self._copies((0, 2)))
+        self.assertTrue(torch.equal(conv[2], conv[0]))
+        self.assertTrue(torch.equal(ssm[2], ssm[0]))
+        self.assertTrue(torch.equal(conv[1], torch.arange(5, 10, dtype=torch.int32).remainder(251).to(torch.uint8)))
+
+    def test_shared_raw_regions_are_copied_once(self):
+        runner = self._runner()
+        num_blocks = 4
+        raw, packet, _, _ = self._dense(runner, "attn.0", num_blocks)
+        # A second C8 layer of the same group shares the raw allocation;
+        # both entries alias the same region, which the data_ptr dedup
+        # must handle without double copies (idempotent here, but the
+        # second copy would be wasted work).
+        runner._record_c8_mxfp_raw_region("attn.1", runner.kv_caches[0], raw, num_blocks, scheduler_chunk=1)
+        runner.kv_caches.append(runner.kv_caches[0])
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks(self._copies((0, 3)))
+        self.assertTrue(torch.equal(raw[3 * packet : 4 * packet], before[:packet]))
+
+    def test_no_copies_is_a_noop(self):
+        runner = self._runner()
+        raw, _, _, _ = self._dense(runner, "attn.0", num_blocks=2)
+        before = raw.clone()
+        runner._copy_c8_mxfp_blocks([])
+        self.assertTrue(torch.equal(raw, before))
 
 
 if __name__ == "__main__":
