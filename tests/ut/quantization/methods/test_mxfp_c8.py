@@ -76,12 +76,12 @@ class TestMXFPScaleCacheShapes(TestBase):
 
 
 class TestMXFPPagedCacheViews(TestBase):
-    """Packet-packed strided views: [K | K_scale | V] packets plus a V-scale tail.
+    """Packet-packed strided views: [K | V] packets plus scale tail segments.
 
     The layout replaces the four section-major caches: one packet per kernel
-    block, packets contiguous, K/V/K-scale as dim0-strided views, and the
-    V-scale cache as one contiguous segment after the packet region. What
-    must hold is checked here on CPU: the section math, the view geometry
+    block, packets contiguous, K/V as dim0-strided views, and the K-scale and
+    V-scale caches as contiguous segments after the packet region. What must
+    hold is checked here on CPU: the section math, the view geometry
     (shape/stride/storage_offset) and -- most importantly, because a stride
     bug misplaces data instead of crashing -- byte-for-byte equivalence of
     writes through the strided views against the section-major layout this
@@ -98,6 +98,7 @@ class TestMXFPPagedCacheViews(TestBase):
     def _payload_bytes(self):
         return self.NUM_BLOCKS * (
             mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
+            + mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
             + mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
         )
 
@@ -114,17 +115,18 @@ class TestMXFPPagedCacheViews(TestBase):
         return raw, k, v, ks, vs
 
     def test_packet_sections_sum_to_the_page_budget(self):
-        # Section bytes of one packet must sum to the documented C8 K/V/Ks
-        # budget (FP8 K/V payloads + one E8M0 byte per 32 data bytes); the
-        # V-scale segment adds the same scale budget per block.
-        k, ks, v = mxfp_packet_section_sizes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
+        # Section bytes of one packet must sum to the documented C8 K/V
+        # budget (FP8 payloads); each scale segment adds one E8M0 byte per
+        # 32 data bytes of its own payload.
+        k, v = mxfp_packet_section_sizes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
+        ks = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
         vs = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
         self.assertEqual(k, self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM)
         self.assertEqual(v, k)
         self.assertEqual(ks, self.NUM_KV_HEADS * self.BLOCK_SIZE * self.HEAD_DIM // MXFP8_GROUP_SIZE)
         self.assertEqual(vs, ks)
         self.assertEqual(
-            k + ks + v,
+            k + v,
             mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM),
         )
 
@@ -144,40 +146,39 @@ class TestMXFPPagedCacheViews(TestBase):
             mxfp_v_scale_cache_shape(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM),
         )
         packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
-        for view in (k, v, ks):
+        for view in (k, v):
             # dim0 = kernel block, one packet apart; block-internal layout
             # stays contiguous, which is the documented operator contract.
             self.assertEqual(view.stride(0), packet)
             self.assertTrue(all(s > 0 for s in view.stride()[1:]))
-        # The V-scale cache is one contiguous segment: kernel blocks are
+        # Both scale caches are contiguous segments: kernel blocks are
         # packed back to back with their natural 6-D strides.
+        self.assertTrue(ks.is_contiguous())
         self.assertTrue(vs.is_contiguous())
+        self.assertEqual(
+            ks.stride(0),
+            mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM),
+        )
         self.assertEqual(
             vs.stride(0),
             mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM),
         )
 
     def test_views_partition_the_payload_without_overlap(self):
-        # K at the packet head, then K-scale, then V: the three storage
-        # offsets must tile one packet exactly once, and the V-scale segment
-        # must start right after the packet region.
+        # K at the packet head, then V: the two storage offsets must tile
+        # one packet exactly once, and the scale segments must follow the
+        # packet region back to back.
         raw, k, v, ks, vs = self._views()
-        k_s, ks_s, v_s = mxfp_packet_section_sizes(
+        k_s, v_s = mxfp_packet_section_sizes(
             self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM
         )
-        packet = k_s + ks_s + v_s
-        offsets = sorted(
-            [
-                (k.storage_offset(), k_s),
-                (ks.storage_offset(), ks_s),
-                (v.storage_offset(), v_s),
-            ]
-        )
-        self.assertEqual(offsets[0][0], 0)
-        for (off, size), (next_off, _) in zip(offsets, offsets[1:]):
-            self.assertEqual(off + size, next_off)
-        self.assertEqual(offsets[-1][0] + offsets[-1][1], packet)
-        self.assertEqual(vs.storage_offset(), self.NUM_BLOCKS * packet)
+        ks_s = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
+        vs_s = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
+        packet = k_s + v_s
+        self.assertEqual(k.storage_offset(), 0)
+        self.assertEqual(v.storage_offset(), k_s)
+        self.assertEqual(ks.storage_offset(), self.NUM_BLOCKS * packet)
+        self.assertEqual(vs.storage_offset(), self.NUM_BLOCKS * (packet + ks_s))
 
     def test_strided_writes_match_the_section_major_layout(self):
         """Byte-equivalence against the layout this replaces.
@@ -268,6 +269,7 @@ class TestScatterMXFPPaNzKvCache(TestBase):
             self.NUM_BLOCKS
             * (
                 mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM, self.HEAD_DIM)
+                + mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
                 + mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.BLOCK_SIZE, self.HEAD_DIM)
             ),
             dtype=torch.int8,

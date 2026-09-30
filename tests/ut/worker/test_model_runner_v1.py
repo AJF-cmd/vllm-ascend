@@ -32,6 +32,7 @@ from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     mxfp_hybrid_paged_cache_views,
+    mxfp_k_scale_page_bytes,
     mxfp_packet_size_bytes,
     mxfp_paged_cache_views,
     mxfp_v_scale_cache_shape,
@@ -3174,16 +3175,17 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
 
     def _dense(self, runner, name, num_blocks):
         packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        k_scale = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
         v_scale = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
         # Byte pattern names the (block, byte) source position uniquely.
-        raw = torch.arange(num_blocks * (packet + v_scale), dtype=torch.int32).remainder(251).to(torch.int8)
+        raw = torch.arange(num_blocks * (packet + k_scale + v_scale), dtype=torch.int32).remainder(251).to(torch.int8)
         views = mxfp_paged_cache_views(
             raw, num_blocks, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
         )
         runner.kv_cache_config = SimpleNamespace(num_blocks=num_blocks)
         runner._record_c8_mxfp_raw_region(name, views, raw, num_blocks, scheduler_chunk=1)
         runner.kv_caches.append(views)
-        return raw, packet, v_scale
+        return raw, packet, k_scale, v_scale
 
     def _copies(self, *pairs):
         return [SimpleNamespace(src_block_id=s, dst_block_id=d) for s, d in pairs]
@@ -3191,15 +3193,22 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
     def test_dense_copy_moves_whole_packets(self):
         runner = self._runner()
         num_blocks = 4
-        raw, packet, v_scale = self._dense(runner, "layer.0", num_blocks)
+        raw, packet, k_scale, v_scale = self._dense(runner, "layer.0", num_blocks)
         before = raw.clone()
         runner._copy_c8_mxfp_blocks(self._copies((1, 3)))
         # Packet region: block 3 now mirrors block 1 byte for byte; every
         # other packet kept.
         self.assertTrue(torch.equal(raw[3 * packet : 4 * packet], before[1 * packet : 2 * packet]))
         self.assertTrue(torch.equal(raw[: 3 * packet], before[: 3 * packet]))
-        # V-scale segment: block 3 mirrors block 1 as well.
-        vs_base = num_blocks * packet
+        # Scale segments: block 3 mirrors block 1 in each of them.
+        ks_base = num_blocks * packet
+        self.assertTrue(
+            torch.equal(
+                raw[ks_base + 3 * k_scale : ks_base + 4 * k_scale],
+                before[ks_base + k_scale : ks_base + 2 * k_scale],
+            )
+        )
+        vs_base = ks_base + num_blocks * k_scale
         self.assertTrue(
             torch.equal(
                 raw[vs_base + 3 * v_scale : vs_base + 4 * v_scale],
@@ -3213,8 +3222,9 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
         num_sched = 2
         num_kernel = num_sched * chunk
         packet = mxfp_packet_size_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM, self.HEAD_DIM)
+        k_scale = mxfp_k_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
         v_scale = mxfp_v_scale_page_bytes(self.NUM_KV_HEADS, self.KERNEL_BLOCK, self.HEAD_DIM)
-        payload = num_kernel * (packet + v_scale)
+        payload = num_kernel * (packet + k_scale + v_scale)
         raw = torch.arange(9 + payload, dtype=torch.int32).remainder(251).to(torch.int8)
         views = mxfp_hybrid_paged_cache_views(
             raw, num_kernel, self.NUM_KV_HEADS, self.HEAD_DIM, self.HEAD_DIM, self.KERNEL_BLOCK
@@ -3231,8 +3241,13 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
         self.assertTrue(torch.equal(raw[9 + span : 9 + 2 * span], before[9 : 9 + span]))
         # The mamba front section is untouched by the attention copy.
         self.assertTrue(torch.equal(raw[:9], before[:9]))
-        # V-scale segment: scheduler block 1 mirrors scheduler block 0.
-        vs_base = 9 + num_kernel * packet
+        # Scale segments: scheduler block 1 mirrors scheduler block 0.
+        ks_base = 9 + num_kernel * packet
+        ks_span = chunk * k_scale
+        self.assertTrue(
+            torch.equal(raw[ks_base + ks_span : ks_base + 2 * ks_span], before[ks_base : ks_base + ks_span])
+        )
+        vs_base = ks_base + num_kernel * k_scale
         vs_span = chunk * v_scale
         self.assertTrue(
             torch.equal(raw[vs_base + vs_span : vs_base + 2 * vs_span], before[vs_base : vs_base + vs_span])
@@ -3253,7 +3268,7 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
     def test_shared_raw_regions_are_copied_once(self):
         runner = self._runner()
         num_blocks = 4
-        raw, packet, _ = self._dense(runner, "attn.0", num_blocks)
+        raw, packet, _, _ = self._dense(runner, "attn.0", num_blocks)
         # A second C8 layer of the same group shares the raw allocation;
         # both entries alias the same region, which the data_ptr dedup
         # must handle without double copies (idempotent here, but the
@@ -3266,7 +3281,7 @@ class TestC8MXFPBlockCopy(unittest.TestCase):
 
     def test_no_copies_is_a_noop(self):
         runner = self._runner()
-        raw, _, _ = self._dense(runner, "attn.0", num_blocks=2)
+        raw, _, _, _ = self._dense(runner, "attn.0", num_blocks=2)
         before = raw.clone()
         runner._copy_c8_mxfp_blocks([])
         self.assertTrue(torch.equal(raw, before))

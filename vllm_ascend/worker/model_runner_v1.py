@@ -4819,14 +4819,15 @@ class NPUModelRunner(GPUModelRunner):
         per-section copy path cannot ``view()``. Block-granularity copies
         (prefix-cache CoW) must instead copy whole scheduler blocks of the
         underlying raw bytes: the packet region (K sits at the packet head,
-        dim0 stride = packet size) plus the contiguous V-scale segment that
-        follows it. A dense layer owns one packet per scheduler block; a
-        hybrid attention region owns its ``scheduler_chunk`` packets
-        contiguously per scheduler block.
+        dim0 stride = packet size) plus the contiguous K-scale and V-scale
+        segments that follow it. A dense layer owns one packet per
+        scheduler block; a hybrid attention region owns its
+        ``scheduler_chunk`` packets contiguously per scheduler block.
         """
         packet_size = views[0].stride(0)
         scheduler_span = packet_size * scheduler_chunk
-        v_scale = views[3]
+        k_scale, v_scale = views[2], views[3]
+        ks_scheduler_span = k_scale.stride(0) * scheduler_chunk
         vs_scheduler_span = v_scale.stride(0) * scheduler_chunk
         num_scheduler_blocks = num_kernel_blocks // scheduler_chunk
         self._c8_mxfp_copy_regions[layer_name] = (
@@ -4834,6 +4835,8 @@ class NPUModelRunner(GPUModelRunner):
             views[0].storage_offset(),
             num_scheduler_blocks,
             scheduler_span,
+            k_scale.storage_offset(),
+            ks_scheduler_span,
             v_scale.storage_offset(),
             vs_scheduler_span,
         )
@@ -4848,7 +4851,7 @@ class NPUModelRunner(GPUModelRunner):
         the generic segmented copy cannot express. Copy each C8 region's
         whole scheduler blocks from the raw bytes instead -- one
         ``index_select``/``index_copy_`` per region segment (the packet
-        region and the V-scale segment) over int8 bytes covers K, V and
+        region and both scale segments) over int8 bytes covers K, V and
         both scale caches and never touches the FP8 aclnnIndex restriction.
         Non-C8 entries of the same deployment (e.g. hybrid recurrent
         states) keep dim0 = scheduler block and are copied per tensor.
@@ -4862,15 +4865,20 @@ class NPUModelRunner(GPUModelRunner):
         )
         src_ids, dst_ids = ids.unbind(dim=1)
         seen_ptrs: set[int] = set()
-        for raw, offset, region_blocks, span, vs_offset, vs_span in self._c8_mxfp_copy_regions.values():
+
+        def _copy_segment(raw, offset, region_blocks, span):
+            blocks = raw[offset : offset + region_blocks * span].view(region_blocks, span)
+            blocks.index_copy_(0, dst_ids, torch.index_select(blocks, 0, src_ids))
+
+        for region in self._c8_mxfp_copy_regions.values():
+            raw, offset = region[0], region[1]
             ptr = raw.data_ptr() + offset
             if ptr in seen_ptrs:
                 continue
             seen_ptrs.add(ptr)
-            blocks = raw[offset : offset + region_blocks * span].view(region_blocks, span)
-            blocks.index_copy_(0, dst_ids, torch.index_select(blocks, 0, src_ids))
-            vs_blocks = raw[vs_offset : vs_offset + region_blocks * vs_span].view(region_blocks, vs_span)
-            vs_blocks.index_copy_(0, dst_ids, torch.index_select(vs_blocks, 0, src_ids))
+            for seg_offset, seg_span in zip(region[4::2], region[5::2]):
+                _copy_segment(raw, seg_offset, region[2], seg_span)
+            _copy_segment(raw, offset, region[2], region[3])
         for layer_cache in self.kv_caches:
             tensors = layer_cache if isinstance(layer_cache, (list, tuple)) else (layer_cache,)
             for cache_tensor in tensors:
@@ -4921,7 +4929,7 @@ class NPUModelRunner(GPUModelRunner):
         # Raw copy regions of the packet-packed C8 caches, filled by
         # _reshape_kv_cache_tensors for prefix-cache CoW.
         self._c8_mxfp_copy_regions: dict[
-            str, tuple[torch.Tensor, int, int, int, int, int]
+            str, tuple[torch.Tensor, int, int, int, int, int, int, int]
         ] = {}
         self._c8_mxfp_view_ptrs: set[int] = set()
         with allocation_context:
@@ -5470,10 +5478,10 @@ class NPUModelRunner(GPUModelRunner):
                             # The packed spec head_size carries the E8M0 scale
                             # bytes; the page budget splits into four raw
                             # payloads: K, V, K-scale, V-scale. The allocation
-                            # below packs K/K-scale/V into one packet-packed
-                            # buffer (per-kernel-block [K|Ks|V] packets plus a
-                            # contiguous V-scale segment), so only the section
-                            # sizes matter here.
+                            # below packs them into one packet-packed buffer
+                            # (per-kernel-block [K|V] packets plus contiguous
+                            # K-scale and V-scale segments), so only the
+                            # section sizes matter here.
                             ori_k_dim = k_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
                             ori_v_dim = v_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
                             kv_head_dim_list = [
@@ -5517,11 +5525,12 @@ class NPUModelRunner(GPUModelRunner):
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                             if self._is_c8_mxfp_kv_cache(current_kv_cache_spec) and not current_sparse_sfa_c8:
                                 # Per-layer private packet-packed buffer:
-                                # one [K | K_scale | V] packet per kernel
-                                # block plus the contiguous V-scale segment,
-                                # same region contract as the generic (k, v)
-                                # pair. One raw allocation also halves the
-                                # Mooncake/ADXL registration count.
+                                # one [K | V] packet per kernel block plus
+                                # the contiguous K-scale and V-scale
+                                # segments, same region contract as the
+                                # generic (k, v) pair. One raw allocation
+                                # also halves the Mooncake/ADXL
+                                # registration count.
                                 assert k_scale_tensor_size is not None and v_scale_tensor_size is not None
                                 kv_cache_raw_tensors[layer_name_inner] = self._allocate_int8_cache_tensor(
                                     k_tensor_size + v_tensor_size + k_scale_tensor_size + v_scale_tensor_size,
@@ -5879,7 +5888,7 @@ class NPUModelRunner(GPUModelRunner):
                         continue  # Skip the rest of the AttentionSpec handling
                     elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
                         # One packet-packed raw allocation per layer
-                        # ([K | K_scale | V] packets + V-scale segment).
+                        # ([K | V] packets + scale segments).
                         raw_k_tensor = kv_cache_raw_tensors[layer_name]
                         assert isinstance(raw_k_tensor, torch.Tensor)
                         raw_v_tensor = None
@@ -5984,9 +5993,9 @@ class NPUModelRunner(GPUModelRunner):
                                 raw_k_tensor = raw_k_tensor[:nope_size]
                                 raw_v_tensor = raw_v_tensor[:rope_size]
                     if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
-                        # Packet-packed strided views: one [K | K_scale | V]
-                        # packet per kernel block plus the contiguous
-                        # V-scale segment; K/V/K_scale are dim0-strided views
+                        # Packet-packed strided views: one [K | V] packet
+                        # per kernel block plus the contiguous K-scale and
+                        # V-scale segments; K/V are dim0-strided views
                         # (dim0 = kernel block, stride = packet size). The
                         # views are final -- scatter and QFA consume them
                         # as-is, so skip the generic per-section reshape
