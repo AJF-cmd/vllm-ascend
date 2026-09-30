@@ -28,7 +28,6 @@ shared by the backend and the model runner.
 import torch
 import torch_npu
 from vllm.config import VllmConfig
-from vllm.logger import logger
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
@@ -741,90 +740,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_scale = key_scale.view(torch.float8_e8m0fnu)
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
-        # Dump only the crossing case (kv beyond the first scheduler
-        # block): dump0 for the prefill crossing (multi-token), dump1 for
-        # the first decode-step crossing (single token) -- the two shapes
-        # that fail on device.
-        crossing = int(seqused_kv[0]) > 3072
-        _dump_idx = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_dump_idx", 0)
-        _want_dump = crossing and (
-            (num_tokens > 1 and _dump_idx == 0) or (num_tokens == 1 and _dump_idx == 1)
-        )
-        if _want_dump:
-            AscendC8MXFPAttentionBackendImpl._c8dbg_dump_idx = _dump_idx + 1
-            logger.warning(
-                "[C8DBG2] #%d k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
-                "layout_q_descale=%s mask=%d msq=%d "
-                "bt0=%s cu_q=%s seq_kv=%s",
-                _dump_idx,
-                key.data_ptr(),
-                key.stride(0),
-                value_scale.data_ptr(),
-                value_scale.stride(0),
-                layout_q_descale,
-                mask_mode,
-                max_seqlen_q,
-                attn_metadata.block_tables[0][:4].tolist()
-                if attn_metadata.block_tables is not None
-                else None,
-                cu_seqlens_q.tolist(),
-                seqused_kv.tolist(),
-            )
-            # Dump the blocks the block table touches, one contiguous block
-            # at a time (whole-view materialization trips the NPU as_strided
-            # range check at this extent), plus the query side. Offline the
-            # same inputs are replayed against a dense layout. First crossing
-            # layer only: later layers see NaN inputs cascading.
-            blocks = sorted(
-                {
-                    int(b)
-                    for row in attn_metadata.block_tables.tolist()
-                    for b in row
-                    if b >= 0
-                }
-            )[:8]
-            self._c8dbg_blocks = blocks
-            dump = {
-                "blocks": blocks,
-                "k": [key[b].view(torch.uint8).cpu() for b in blocks],
-                "v": [value[b].view(torch.uint8).cpu() for b in blocks],
-                "ks": [key_scale[b].view(torch.uint8).cpu() for b in blocks],
-                "vs": [value_scale[b].view(torch.uint8).cpu() for b in blocks],
-                "q": quant_query.view(torch.uint8).cpu(),
-                "q_scale": query_scale.view(torch.uint8).cpu(),
-                "mask": self._qfa_int8_mask(attn_metadata).cpu()
-                if mask_mode != QFA_MASK_MODE_NO_MASK
-                else None,
-                "bt": attn_metadata.block_tables.cpu(),
-                "cu_q": cu_seqlens_q.cpu(),
-                "seq_kv": seqused_kv.cpu(),
-                "mask_mode": mask_mode,
-                "max_seqlen_q": max_seqlen_q,
-                "layout_q_descale": layout_q_descale,
-                "softmax_scale": self.scale,
-                "num_heads": self.num_heads,
-                "num_kv_heads": self.num_kv_heads,
-                "head_size": self.head_size,
-            }
-            torch.save(dump, f"/tmp/c8dbg_qfa_dump{_dump_idx}.pt")
-            logger.warning("[C8DBG3] dumped blocks %s to /tmp/c8dbg_qfa_dump%d.pt", blocks, _dump_idx)
-            self._c8dbg_dump_idx = _dump_idx
         from cann_ops_transformer.ops import quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
         # allocating wrapper is capture-safe under npugraph_ex (ops-transformer
         # golden tests capture exactly this call, GRAPH_PATH=7).
-        _vs = kv_cache[3]
-        _vsb = int(attn_metadata.slot_mapping[0]) // 512 if attn_metadata.slot_mapping is not None else 0
-        _cnt = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_q_count", 0)
-        _dbg_q = _cnt < 8
-        if _dbg_q:
-            AscendC8MXFPAttentionBackendImpl._c8dbg_q_count = _cnt + 1
-            logger.warning(
-                "[C8DBGQ] #%d before QFA: vs[%d]+vs[%d] sum=%d",
-                _cnt, _vsb, _vsb + 1,
-                int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
-            )
         result = quant_flash_attn(
             quant_query,
             key,
@@ -860,22 +780,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        if _dbg_q:
-            logger.warning(
-                "[C8DBGQ] #%d after  QFA: vs[%d]+vs[%d] sum=%d",
-                _cnt, _vsb, _vsb + 1,
-                int(_vs[_vsb].view(torch.uint8).sum()) + int(_vs[_vsb + 1].view(torch.uint8).sum()),
-            )
-        if (
-            int(seqused_kv[0]) > 3072
-            and getattr(self, "_c8dbg_dump_idx", None) is not None
-        ):
-            torch.save(attn_output.float().cpu(), f"/tmp/c8dbg_qfa_out{self._c8dbg_dump_idx}.pt")
-            logger.warning(
-                "[C8DBG3] dumped strided-run output to /tmp/c8dbg_qfa_out%d.pt",
-                self._c8dbg_dump_idx,
-            )
-            self._c8dbg_dump_idx = None
         output[:num_tokens] = attn_output
         return output
 
@@ -990,17 +894,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # 5-D PA_NZ packet-packed views: (kernel_blocks, N, D//32, Bs, 32).
         block_size = key_cache.shape[3]
 
-        def _vs_checksum():
-            vs = kv_cache[3]
-            b = int(slot_mapping[0]) // block_size if slot_mapping.numel() else 0
-            blocks = sorted({int(x) // block_size for x in attn_metadata.block_tables.tolist()[0] if x >= 0} | {b})
-            return [int(vs[b_].view(torch.uint8).sum()) for b_ in blocks]
-
-        _call_count = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_s_count", 0)
-        dbg = _call_count < 20
-        if dbg:
-            AscendC8MXFPAttentionBackendImpl._c8dbg_s_count = _call_count + 1
-            logger.warning("[C8DBGS] #%d before scatter: vs_sums=%s", _call_count, _vs_checksum())
         # Scatter the K/V payloads through the strided packet views; the
         # operator's tiling consumes the dim0 stride as the block stride.
         scatter_mxfp_pa_nz_kv_cache(
@@ -1010,8 +903,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_cache,
             slot_mapping,
         )
-        if dbg:
-            logger.warning("[C8DBGS] #%d after  scatter: vs_sums=%s", _call_count, _vs_checksum())
 
         # Only K's scale is per-token; V's static scale is filled once at KV
         # cache setup by NPUModelRunner._fill_c8_mxfp_v_scale_caches.
@@ -1021,8 +912,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             kv_cache[2],
             self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
         )
-        if dbg:
-            logger.warning("[C8DBGS] #%d after  ks put: vs_sums=%s", _call_count, _vs_checksum())
         notify_kv_cache_written()
 
     def forward(
@@ -1071,19 +960,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             dst_type=torch.float8_e4m3fn,
         )
 
-        _gcnt = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_g_count", 0)
-        if _gcnt < 40:
-            AscendC8MXFPAttentionBackendImpl._c8dbg_g_count = _gcnt + 1
-            n = attn_metadata.num_actual_tokens
-            logger.warning(
-                "[C8DBG0] #%d q_in_nan=%d q_out_nz=%d/%d q_scale_max=%d",
-                _gcnt,
-                int(torch.isnan(query[:n]).sum()),
-                int((query_mxfp8.view(torch.uint8) != 0).sum()),
-                query_mxfp8.numel(),
-                int(query_scale.view(torch.uint8).max()),
-            )
-
         # KV-sharing consumer layers reuse another layer's cache; writing
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
@@ -1092,16 +968,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key[: attn_metadata.num_actual_tokens],
                 dst_type=torch.float8_e4m3fn,
             )
-            if getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_g_count", 0) <= 1:
-                n = attn_metadata.num_actual_tokens
-                logger.warning(
-                    "[C8DBG0k] k_out_nz=%d/%d k_scale_max=%d k_scale_nz=%d/%d",
-                    int((key_mxfp8.view(torch.uint8) != 0).sum()),
-                    key_mxfp8.numel(),
-                    int(key_scale.view(torch.uint8).max()),
-                    int((key_scale.view(torch.uint8) != 0).sum()),
-                    key_scale.numel(),
-                )
 
             original_value_shape = value.shape
             value = value.view(original_value_shape[0], -1)

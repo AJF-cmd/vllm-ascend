@@ -980,7 +980,6 @@ class NPUModelRunner(GPUModelRunner):
         if (
             scheduler_output.kv_cache_block_copies
             and is_c8_mxfp_kv_quant(self.vllm_config)
-            and not getattr(self, "_c8dbg_disable_intercept", True)
         ):
             # The packet-packed C8 caches are dim0-strided views the generic
             # segmented copy cannot view(); take the per-region block copy
@@ -4939,69 +4938,6 @@ class NPUModelRunner(GPUModelRunner):
         # Static V scales are written once, here, and never again.
         self._fill_c8_mxfp_v_scale_caches(kv_caches)
 
-        if not getattr(NPUModelRunner, "_c8dbg_overlap_logged", False):
-            NPUModelRunner._c8dbg_overlap_logged = True
-            leaves: list[tuple[int, int, str]] = []
-            for _ln, _c in kv_caches.items():
-                _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
-                for _t in _ts:
-                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
-                        continue
-                    _sz = _t.numel() * _t.element_size()
-                    leaves.append((_t.data_ptr(), _sz, _ln))
-            _found = False
-            for _i in range(len(leaves)):
-                _s1, _n1, _l1 = leaves[_i]
-                for _j in range(_i + 1, len(leaves)):
-                    _s2, _n2, _l2 = leaves[_j]
-                    if _s1 == _s2 and _n1 == _n2:
-                        continue
-                    _lo = max(_s1, _s2)
-                    _hi = min(_s1 + _n1, _s2 + _n2)
-                    if _lo < _hi:
-                        _tag = "SAME-LAYER" if _l1 == _l2 else "CROSS-LAYER"
-                        logger.warning(
-                            "[C8DBG6] OVERLAP %s %s [%d..%d) <-> %s [%d..%d)",
-                            _tag,
-                            _l1,
-                            _s1,
-                            _s1 + _n1,
-                            _l2,
-                            _s2,
-                            _s2 + _n2,
-                        )
-                        _found = True
-            if not _found:
-                logger.warning("[C8DBG6] no cache overlap (%d leaves)", len(leaves))
-            _sample = 0
-            for _ln, _c in kv_caches.items():
-                if _sample >= 4:
-                    break
-                _ts = _c if isinstance(_c, (list, tuple)) else (_c,)
-                for _t in _ts:
-                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
-                        continue
-                    logger.warning(
-                        "[C8DBG9] %s shape=%s dtype=%s ptr=%d bytes=%d",
-                        _ln, tuple(_t.shape), _t.dtype, _t.data_ptr(),
-                        _t.numel() * _t.element_size(),
-                    )
-                _sample += 1
-            _seen_raw = set()
-            for _ln, _raw in kv_cache_raw_tensors.items():
-                _ts = _raw if isinstance(_raw, (list, tuple)) else (_raw,)
-                for _t in _ts:
-                    if _t is None or not isinstance(_t, torch.Tensor) or _t.dim() == 0:
-                        continue
-                    _key = (_t.data_ptr(), _t.numel())
-                    if _key in _seen_raw:
-                        continue
-                    _seen_raw.add(_key)
-                    logger.warning(
-                        "[C8DBG8] raw %s [%d..%d) numel=%d",
-                        _ln, _t.data_ptr(), _t.data_ptr() + _t.numel(), _t.numel(),
-                    )
-
         if any(
             isinstance(self.compilation_config.static_forward_context.get(name), v41_cache_layer_type)
             for name in kv_caches
@@ -6026,26 +5962,9 @@ class NPUModelRunner(GPUModelRunner):
                                 head_dim,
                                 kernel_block_size,
                             )
-                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
-                        logger.warning(
-                            "[C8DBG] %s nb=%d kbs=%d n=%d d=%d raw=%d "
-                            "k_shape=%s k_stride0=%d k_off=%d "
-                            "vs_shape=%s vs_stride0=%d vs_off=%d",
-                            layer_name,
-                            num_kernel_blocks,
-                            kernel_block_size,
-                            num_kv_heads_c8,
-                            head_dim,
-                            raw_k_tensor.numel(),
-                            tuple(k_cache.shape),
-                            k_cache.stride(0),
-                            k_cache.storage_offset(),
-                            tuple(v_scale_cache.shape),
-                            v_scale_cache.stride(0),
-                            v_scale_cache.storage_offset(),
-                        )
-                        # scheduler_chunk: packets per scheduler block (dense
-                        # 1:1; hybrid = spec block / kernel block).
+                         kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
+                         # scheduler_chunk: packets per scheduler block (dense
+                         # 1:1; hybrid = spec block / kernel block).
                         self._record_c8_mxfp_raw_region(
                             layer_name,
                             (k_cache, v_cache, k_scale_cache, v_scale_cache),
