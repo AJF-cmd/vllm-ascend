@@ -721,12 +721,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
         # Dump only the crossing case (kv beyond the first scheduler
-        # block) -- the shape that fails on device. The first two crossings
-        # (typically the prefill chunk and the first decode step) go to
-        # separate files for offline replay.
+        # block): dump0 for the prefill crossing (multi-token), dump1 for
+        # the first decode-step crossing (single token) -- the two shapes
+        # that fail on device.
         crossing = int(seqused_kv[0]) > 3072
         _dump_idx = getattr(AscendC8MXFPAttentionBackendImpl, "_c8dbg_dump_idx", 0)
-        if crossing and _dump_idx < 2:
+        _want_dump = crossing and (
+            (num_tokens > 1 and _dump_idx == 0) or (num_tokens == 1 and _dump_idx == 1)
+        )
+        if _want_dump:
             AscendC8MXFPAttentionBackendImpl._c8dbg_dump_idx = _dump_idx + 1
             logger.warning(
                 "[C8DBG2] #%d k_ptr=%d k_stride0=%d vs_ptr=%d vs_stride0=%d "
