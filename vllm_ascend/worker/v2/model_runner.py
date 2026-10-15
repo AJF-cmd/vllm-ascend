@@ -30,6 +30,7 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -58,6 +59,10 @@ from vllm_ascend.ascend_forward_context import (
     select_moe_comm_method,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+)
+from vllm_ascend.attention.attention_c8_mxfp import (
+    AscendC8MXFPAttentionBackendImpl,
+    fill_mxfp_v_scale_cache,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -88,6 +93,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
+    is_c8_mxfp_kv_quant,
     is_deepseek_v41,
     lmhead_tp_enable,
     lmhead_tp_max_num_logits,
@@ -96,7 +102,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
-from vllm_ascend.worker.utils import disable_compilation
+from vllm_ascend.worker.utils import AscendKVBlockZeroer, disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
@@ -117,6 +123,7 @@ from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpecul
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
     AscendV2KVBlockZeroer,
+    C8KVBlockZeroer,
     prepare_v41_dummy_ring_state,
     prepare_v41_source_rope,
     torch_cuda_wrapper,
@@ -390,6 +397,21 @@ class NPUModelRunner(GPUModelRunner):
 
     def _init_kv_zero_meta(self) -> None:
         """Use a tuple-aware zeroer for Ascend V1-compatible cache protocols."""
+        if is_c8_mxfp_kv_quant(self.vllm_config):
+            # The C8 zeroer skips the static V scales while clearing recycled
+            # blocks and the wrapper restores them; the generic zeroer below
+            # would clear every tuple component including the V scales.
+            zeroer = AscendKVBlockZeroer(self.device, is_pin_memory_available())
+            zeroer.init_meta(
+                attn_groups_iter=(group for groups in self.attn_groups for group in groups),
+                kernel_block_sizes=self.kernel_block_sizes,
+                cache_dtype=self.cache_config.cache_dtype,
+                runner_only_attn_layers=getattr(self, "runner_only_attn_layers", set()),
+                static_forward_context=self.compilation_config.static_forward_context,
+            )
+            entries = getattr(self, "_c8_mxfp_v_scale_caches", [])
+            self.kv_block_zeroer = C8KVBlockZeroer(zeroer, entries, fill_mxfp_v_scale_cache)
+            return
 
         self.kv_block_zeroer = AscendV2KVBlockZeroer(
             self.device,
@@ -502,6 +524,41 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+
+        self._fill_c8_mxfp_v_scale_caches()
+
+    def _fill_c8_mxfp_v_scale_caches(self) -> None:
+        """Initialize C8 V scales and retain views for page reassignment."""
+        self._c8_mxfp_v_scale_caches = []
+        num_blocks = self.kv_cache_config.num_blocks
+        if num_blocks <= 0:
+            return
+        for layer in self.compilation_config.static_forward_context.values():
+            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
+                value_scale_cache = layer.kv_cache[3]
+                assert value_scale_cache.shape[0] % num_blocks == 0
+                kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
+                self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
+                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
+        entries = self._c8_mxfp_v_scale_caches
+        if entries:
+            # Re-wrap in place so reinitialization keeps a single wrapper.
+            delegate = getattr(self, "kv_block_zeroer", None)
+            if isinstance(delegate, C8KVBlockZeroer):
+                delegate = delegate.delegate
+            self.kv_block_zeroer = C8KVBlockZeroer(delegate, entries, fill_mxfp_v_scale_cache)
+
+    def shutdown(self) -> None:
+        # Drop C8 packet views before the parent collects tensors and
+        # empties the allocator cache.
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
+        if entries is not None:
+            entries.clear()
+        zeroer = getattr(self, "kv_block_zeroer", None)
+        if isinstance(zeroer, C8KVBlockZeroer):
+            zeroer.entries.clear()
+            self.kv_block_zeroer = zeroer.delegate
+        super().shutdown()
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
