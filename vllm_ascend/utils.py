@@ -1562,6 +1562,34 @@ def uses_mooncake_connector(kv_transfer_config: Any) -> bool:
     return bool(_collect_kv_connector_names(kv_transfer_config) & mooncake_connector_names)
 
 
+# C8-MXFP attention exposes each layer's cache as a four-view tuple
+# (k, v, k_scale, v_scale) over one packet backing storage. Only transports
+# that move per-layer caches as raw byte blocks (data_ptr + size, component
+# agnostic) keep the E8M0 scales intact; transports that re-parse K/V
+# components would silently drop them and corrupt the FP8 payloads.
+# A connector joins this set after a byte-block transport review plus
+# on-device verification (put/lookup/load/decode fact-check).
+_C8_MXFP_BYTE_BLOCK_CONNECTORS = {
+    # A5-era PD transfer, verified with the MXFP8 packet layout.
+    "MooncakeConnector",
+    "MooncakeConnectorV1",
+    "MooncakeConnectorV2",
+    # Unified store pool; verified on-device with the memcache backend
+    # (2026-11-05: put, lookup, 40k-token load, decode fact-check).
+    "AscendStoreConnector",
+    # kv_offload/native: the Ascend canonicalizer explicitly models split
+    # K/V/scale views and refuses layouts that would omit scale components.
+    "OffloadingConnector",
+    # kv_offload/simple: deduplicates per-layer caches by backing storage
+    # and mirrors whole pages as int8 byte blocks.
+    "SimpleCPUOffloadConnector",
+}
+
+
+def supports_c8_mxfp_kv_transfer(kv_transfer_config: Any) -> bool:
+    return bool(_collect_kv_connector_names(kv_transfer_config) & _C8_MXFP_BYTE_BLOCK_CONNECTORS)
+
+
 def _collect_kv_connector_names(value: Any) -> set[str]:
     connector_names: set[str] = set()
     if isinstance(value, dict):
