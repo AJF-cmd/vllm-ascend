@@ -328,7 +328,10 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
     """
 
     _logged = False
-    _fia_logged = False
+    # One log line per attention state per worker process (a set rather
+    # than a flag): validation rounds can confirm each routed state's
+    # activation without per-step log noise.
+    _fia_logged_states: set[str] = set()
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -694,15 +697,16 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         cumulative-end-offset length lists and the int8 splitfuse mask
         template that sparse_mode=3 requires (p1b CHECK-3).
         """
-        if not AscendQFA3Int8Impl._fia_logged:
+        state_name = attn_metadata.attn_state.name
+        if state_name not in AscendQFA3Int8Impl._fia_logged_states:
+            AscendQFA3Int8Impl._fia_logged_states.add(state_name)
             logger.info(
                 "A3 QFA INT8: pure-prefill step routed to BF16 FIA "
                 "(state=%s, reqs=%d, tokens=%d); int8 cache write unchanged.",
-                attn_metadata.attn_state.name,
+                state_name,
                 len(attn_metadata.seq_lens_list),
                 attn_metadata.num_actual_tokens,
             )
-            AscendQFA3Int8Impl._fia_logged = True
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
