@@ -99,6 +99,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # addresses blocks by the shape's inner product and ignores the packet
     # views' dim0 stride. Not sensitive.
     "VLLM_ASCEND_QFA_SCATTER_WRITE": lambda: bool(int(os.getenv("VLLM_ASCEND_QFA_SCATTER_WRITE", "1"))),
+    # Route pure-prefill steps of the int8_qfa KV cache through the stock
+    # BF16 FIA read path while decode keeps the QFA paged operator: a fresh
+    # prompt (PrefillNoCache) runs FIA on the current-step q/k/v directly;
+    # PrefillCacheHit / pure-prefill chunked continuations gather + dequant
+    # the int8 packet cache to dense BF16 before FIA. Motivation: the QFA
+    # prefill kernel is 1.72x (NoCache) / 40% (WithCache) slower than FIA,
+    # operator-team confirmed as not fixable near-term. The int8 packet
+    # write path is unchanged either way. "0" restores the one-QFA-call
+    # read for every state (A/B reference). Not sensitive.
+    "VLLM_ASCEND_QFA_A3_PREFILL_FIA": lambda: bool(int(os.getenv("VLLM_ASCEND_QFA_A3_PREFILL_FIA", "1"))),
 }
 
 # end-env-vars-definition

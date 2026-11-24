@@ -33,6 +33,7 @@ import torch_npu
 from vllm.v1.attention.backend import AttentionType  # type: ignore[import-not-found]
 
 from vllm_ascend import envs
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendAttentionState,
@@ -47,6 +48,10 @@ QFA_MASK_NO_MASK = 0
 QFA_MASK_CAUSAL = 3
 QFA_ABSMAX_EPS = 1e-12
 QFA_INT8_NZ_DIM_FRAG = 32
+# npu_fused_infer_attention_score causal sparse mode: requires an explicit
+# atten_mask (the int8 splitfuse triangular template) and pairs with the
+# cumulative-end-offset TND length lists (probe p1b_v3, 2026-11-24).
+FIA_SPARSE_MODE_CAUSAL = 3
 
 
 def _quantize_per_token_head(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -310,23 +315,32 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
       (``VLLM_ASCEND_QFA_SCATTER_WRITE=0`` falls back to the strided
       index_put_ A/B reference, which materializes the whole per-layer
       pool per call).
-    - Read path: one QFA call per step for the whole batch (decode and
-      prefill alike; the causal mask covers decode rows too).
+    - Read path: decode steps keep one QFA call per step (paged INT8
+      read, the 1.9x bandwidth win); pure-prefill steps route to BF16
+      FIA when ``VLLM_ASCEND_QFA_A3_PREFILL_FIA`` is on (default) -- a
+      fresh prompt runs the stock FIA on the current-step q/k/v, while
+      cached histories are gathered + dequantized from the packet views
+      to dense BF16 (probe p1b_v3 contract; the QFA prefill kernel is
+      1.72x/40% slower than FIA and not fixable near-term).
 
     Precondition violations fail fast (unsupported model shapes must not
     silently detour to a different numerics path).
     """
 
     _logged = False
+    _fia_logged = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if not AscendQFA3Int8Impl._logged:
             logger.info(
                 "A3 QFA INT8 KV cache attention enabled "
-                "(--kv-cache-dtype int8_qfa); one QFA call per step for "
-                "decode and prefill alike. KV write path: %s "
+                "(--kv-cache-dtype int8_qfa); %s. KV write path: %s "
                 "(VLLM_ASCEND_QFA_SCATTER_WRITE=%d).",
+                "decode reads QFA, pure-prefill reads BF16 FIA "
+                "(VLLM_ASCEND_QFA_A3_PREFILL_FIA=1)"
+                if envs.VLLM_ASCEND_QFA_A3_PREFILL_FIA
+                else "one QFA call per step for decode and prefill alike",
                 "triton scatter over the packet views"
                 if envs.VLLM_ASCEND_QFA_SCATTER_WRITE
                 else "strided index_put_ reference",
@@ -574,6 +588,35 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
             self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
 
+        # Pure-prefill steps read BF16 via FIA and skip the QFA prefill
+        # kernel degradation (probe p1b_v3: gather+dequant+FIA matches the
+        # int8-semantics software reference at rel_fro 0.61%). Guards:
+        # eager only (graph capture bakes the QFA call; the dummy capture
+        # batch is DecodeOnly and build_for_graph_capture rejects
+        # PrefillNoCache anyway, but keep the branch uncapturable under
+        # any config); pure-prefill batches only (no decode rows -- a
+        # mixed batch keeps the single QFA call until phase 2); the
+        # length-list lengths must agree or the batch shape is not the
+        # plain eager form the FIA contract relies on.
+        if (
+            envs.VLLM_ASCEND_QFA_A3_PREFILL_FIA
+            and not _EXTRA_CTX.capturing
+            and key is not None
+            and value is not None
+            and self.kv_sharing_target_layer_name is None
+            and attn_metadata.causal
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_prefills > 0
+            and len(attn_metadata.actual_seq_lengths_q) == len(attn_metadata.seq_lens_list)
+            and attn_metadata.attn_state
+            in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill,
+            )
+        ):
+            return self._forward_fia_prefill(query, key, value, kv_cache, attn_metadata, output)
+
         # Attention on the quantized cache.
         from cann_ops_transformer.ops import quant_flash_attn
 
@@ -626,6 +669,98 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
             return_softmax_lse=False,
         )
         output[:num_tokens] = attn_out.view(num_tokens, self.num_heads, self.head_size)
+        return output
+
+    def _forward_fia_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """BF16 FIA read for a pure-prefill step (probe p1b_v3 contract).
+
+        PrefillNoCache has no history anywhere in the batch, so the stock
+        FIA consumes the current-step q/k/v directly -- for that state
+        ``_get_fia_params`` never touches the int8 cache views and the
+        DeviceOperator ignores key_cache/value_cache entirely when
+        block_table is None. PrefillCacheHit and pure-prefill chunked
+        continuations gather this batch's pages from the packet views
+        (torch indexing respects the page pitch -- p1b CHECK-1 bitwise),
+        dequantize them (K: per-token descale, V: static per-head scale
+        -- p1b CHECK-2), and run FIA TND on the dense result with the
+        cumulative-end-offset length lists and the int8 splitfuse mask
+        template that sparse_mode=3 requires (p1b CHECK-3).
+        """
+        if not AscendQFA3Int8Impl._fia_logged:
+            logger.info(
+                "A3 QFA INT8: pure-prefill step routed to BF16 FIA "
+                "(state=%s, reqs=%d, tokens=%d); int8 cache write unchanged.",
+                attn_metadata.attn_state.name,
+                len(attn_metadata.seq_lens_list),
+                attn_metadata.num_actual_tokens,
+            )
+            AscendQFA3Int8Impl._fia_logged = True
+
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
+        num_tokens = attn_metadata.num_actual_tokens
+        k_nz, kd_view, v_nz = kv_cache
+        block_size = self._kernel_block_size()
+        seq_lens = attn_metadata.seq_lens_list
+        num_reqs = len(seq_lens)
+        max_pages = (max(seq_lens) + block_size - 1) // block_size
+        block_table = attn_metadata.block_tables[:num_reqs, :max_pages]
+        flat = block_table.reshape(-1).to(torch.long)
+
+        # Request-major dense gather: page rows in block-table order, then
+        # mask each request's padded tail by its true length. The current
+        # chunk is included (gather scope A): reshape_and_cache above wrote
+        # it to these pages on the same stream, so the read-back matches
+        # what the QFA path would see.
+        n_heads = self.num_kv_heads
+        head_dim = self.head_size
+        g_k = k_nz[flat].permute(0, 3, 1, 2, 4).reshape(-1, n_heads, head_dim)
+        g_kd = kd_view[flat].permute(0, 2, 1).reshape(-1, n_heads)
+        g_v = v_nz[flat].permute(0, 3, 1, 2, 4).reshape(-1, n_heads, head_dim)
+        keep = torch.zeros(
+            num_reqs * max_pages * block_size, dtype=torch.bool, device=flat.device
+        )
+        row = 0
+        for seq_len in seq_lens:
+            keep[row : row + seq_len] = True
+            row += max_pages * block_size
+        k_deq = g_k[keep].to(torch.bfloat16)
+        k_deq.mul_(g_kd[keep].to(torch.bfloat16).unsqueeze(-1))
+        v_deq = g_v[keep].to(torch.bfloat16)
+        v_deq.mul_(self._layer_v_scale(attn_metadata).view(1, n_heads, 1).to(torch.bfloat16))
+
+        # FIA TND dense contract: both length lists are cumulative end
+        # offsets without a leading zero; the causal sparse mode requires
+        # the int8 splitfuse mask (attn_metadata.attn_mask).
+        kv_lens = []
+        running_total = 0
+        for seq_len in seq_lens:
+            running_total += seq_len
+            kv_lens.append(running_total)
+        attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query[:num_tokens],
+            key=k_deq,
+            value=v_deq,
+            input_layout="TND",
+            atten_mask=attn_metadata.attn_mask,
+            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=kv_lens,
+            num_heads=self.num_heads,
+            num_key_value_heads=n_heads,
+            scale=self.scale,
+            sparse_mode=FIA_SPARSE_MODE_CAUSAL,
+            block_size=block_size,
+        )
+        output[:num_tokens] = attn_out
         return output
 
     def _qfa_block_table(self, attn_metadata, batch_size: int) -> torch.Tensor:
