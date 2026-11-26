@@ -448,20 +448,23 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         if envs.VLLM_ASCEND_QFA_SCATTER_WRITE:
             # Triton scatter: write only the addressed bytes of the strided
             # packet views (the mxfp_k_scale pattern). Strided index_put_
-            # materializes the whole per-layer pool per call (~8.5 ms/layer
-            # at 17k blocks) and NPU IndexPut can copy the strided view back,
-            # overwriting unrelated pages. The fused npu_scatter_pa_kv_cache
-            # operator is NOT usable here: probe v8 (2026-11-20) confirmed it
-            # addresses blocks by the shape's inner product and ignores the
-            # packet views' dim0 stride, while the per-page packet layout
-            # always interleaves the descale section between K and V
-            # (dim0 stride != inner product). Padded rows are clamped to
-            # slot 0 (null block) upstream, keeping shapes static for
-            # aclgraph capture.
-            from vllm_ascend.ops.triton.qfa_kv_scatter import scatter_kv_payload
+            # materializes the whole per-layer pool per call and NPU IndexPut
+            # can copy the strided view back, overwriting unrelated pages.
+            # The fused npu_scatter_pa_kv_cache operator is NOT usable here:
+            # probe v8 (2026-11-20) confirmed it addresses blocks by the
+            # shape's inner product and ignores the packet views' dim0
+            # stride, while the per-page packet layout always interleaves
+            # the descale section between K and V (dim0 stride != inner
+            # product). Padded rows are clamped to slot 0 (null block)
+            # upstream, keeping shapes static for aclgraph capture.
+            from vllm_ascend.ops.triton.qfa_kv_scatter import (
+                scatter_k_descale,
+                scatter_kv_payload,
+            )
 
             scatter_kv_payload(k_int8, k_nz, (pages, pos))
             scatter_kv_payload(v_int8, v_nz, (pages, pos))
+            scatter_k_descale(k_descale_tok, k_descale, (pages, pos))
         else:
             # A/B reference: scatter payloads into the NZ views via strided
             # index_put_. A token's K/V payload is the [Df, 32] tail at
@@ -485,15 +488,11 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
             k_nz.index_put_(nz_index, payload_src)
             payload_src_v = v_int8.view(num_tokens, n_heads, num_frags, nz_last)
             v_nz.index_put_(nz_index, payload_src_v)
-
-        # K descale [T, N] -> (Bn, N, Bs): the 3-D view is fully indexed.
-        # Its strided materialization is only ~17.9 MB (~24 us measured), so
-        # index_put stays even on the fused-scatter path.
-        _, idx_n, _ = self._capture_safe_constants(pages.device)
-        idx_page = pages.view(num_tokens, 1).expand(num_tokens, n_heads)
-        idx_n_2d = idx_n.view(1, n_heads).expand(num_tokens, n_heads)
-        idx_pos = pos.view(num_tokens, 1).expand(num_tokens, n_heads)
-        k_descale.index_put_((idx_page, idx_n_2d, idx_pos), k_descale_tok)
+            # K descale [T, N] -> (Bn, N, Bs): the 3-D view is fully indexed.
+            idx_page = pages.view(num_tokens, 1).expand(num_tokens, n_heads)
+            idx_n_2d = idx_n.view(1, n_heads).expand(num_tokens, n_heads)
+            idx_pos = pos.view(num_tokens, 1).expand(num_tokens, n_heads)
+            k_descale.index_put_((idx_page, idx_n_2d, idx_pos), k_descale_tok)
 
         from vllm_ascend.attention.attention_v1 import notify_kv_cache_written
 
