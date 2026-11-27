@@ -72,13 +72,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Output directory for per-head V amax calibration (QFA INT8 static
-    # fa_v.scale weight generation). When set to a writable directory, each
-    # worker wraps Attention.forward and dumps per-layer per-head value amax
-    # to <dir>/fa_v_stats_rank{rank}.pt once per forward step. Intended for
-    # eager-mode offline calibration only (fa_v_calib module); default ""
-    # keeps it fully inert. Not sensitive.
-    "VLLM_ASCEND_CALIB_FA_V": lambda: os.getenv("VLLM_ASCEND_CALIB_FA_V", ""),
 }
 
 # end-env-vars-definition
