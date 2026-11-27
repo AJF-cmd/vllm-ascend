@@ -68,7 +68,26 @@ All three arguments are required. The Python function returns `None` and updates
 
 ## Test Cases
 
-Validation compares full raw allocations byte-for-byte against a CPU/index_put_ reference, covering: builder geometry cross-check; same-page, page-crossing, prefill (4-page), shuffled-slot, and H=4 cases; overlapping slots (last write wins); padded slots clamped to the null slot; sentinel write-range checks over the whole group-packed allocation; and a service-scale (~100k block) timing comparison against the index_put_ reference. Service-level regression (alternating same-prompt bursts plus the standard burst suite) completes the validation.
+The NPU suite is located under the nightly single-card Triton operator directory:
+
+```bash
+pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_qfa_kv_scatter.py
+```
+
+The suite covers:
+
+- Byte-exact parity against a strided index_put_ reference over the complete raw allocation (sentinel-filled, including the leading strip, per-page padding, and unrelated sections), parametrized over heads 1/2/4, page padding 0/256 bytes, storage offset 0/4096 bytes, contiguous/noncontiguous sources, and token counts 1/64/65/257.
+- NPU graph capture and replay in each combination, changing the source values and slot indices in the captured buffers before replay.
+- Compilation reuse across varying token counts (a JIT hook verifies that changing only the token count does not recompile either kernel).
+- Empty source/index batches preserving the complete cache allocation.
+- Mismatched source sizes rejected with `ValueError` before kernel launch, leaving the cache unchanged.
+- Padded rows clamped to the null slot matching the clamped reference exactly, and back-to-back launches where the last write wins.
+
+CPU dispatch tests live in the unit-test suite with a mocked kernel entry point:
+
+```bash
+pytest -q tests/ut/attention/test_qfa_kv_scatter.py
+```
 
 ## Example
 
