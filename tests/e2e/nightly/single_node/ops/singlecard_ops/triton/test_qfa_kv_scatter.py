@@ -211,7 +211,7 @@ def test_padded_rows_land_only_on_the_null_slot():
     views = _views_on(raw, heads, blocks)
     expected = raw.cpu()
     cpu_views = _views_on(expected, heads, blocks)
-    slots = torch.tensor([200, -1, 4100], dtype=torch.int64)
+    slots = torch.tensor([200, -1, 900], dtype=torch.int64)
     safe = slots.clamp(min=0)
     k, v, kd = _payloads(slots.shape[0], heads, 11)
     _write_reference(cpu_views, safe, k, v, kd)
