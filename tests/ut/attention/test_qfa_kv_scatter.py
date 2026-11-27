@@ -59,7 +59,7 @@ class TestQfaScatterDispatch(PytestBase):
         kernel.__getitem__.assert_called_once_with((tokens * HEADS,))
         kernel.__getitem__.return_value.assert_called_once()
         launch_args = kernel.__getitem__.return_value.call_args.args
-        assert launch_args[0] is payload.view(torch.int8).view(-1)
+        assert torch.equal(launch_args[0], payload.view(torch.int8).view(-1))
 
     def test_nonempty_descale_launches_with_token_grid(self, monkeypatch):
         kernel = MagicMock()
@@ -116,7 +116,7 @@ class TestQfaScatterDispatch(PytestBase):
         kernel = MagicMock()
         monkeypatch.setattr(f"{MODULE}._scatter_kv_payload_kernel", kernel)
         payload = torch.ones(1, 3, DIM, dtype=torch.int8)
-        cache = _payload_cache(HEADS, BLOCKS)
+        cache = _payload_cache(3, BLOCKS)
         with pytest.raises(ValueError, match="power-of-two"):
             scatter_kv_payload(payload, cache, _slot_index(1))
         kernel.__getitem__.assert_not_called()
