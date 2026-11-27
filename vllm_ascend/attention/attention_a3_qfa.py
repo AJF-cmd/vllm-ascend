@@ -16,16 +16,10 @@
 #
 """A3/A2 QFA INT8-GQA attention (quant_mode=12).
 
-Two paths share this file:
-
-1. Prefill (``VLLM_ASCEND_QFA_A3_PREFILL=1``, no KV cache): Q/K quantized
-   per-token-head and V per-head to INT8, fed to the TND-packed operator.
-   Only PrefillNoCache steps qualify; the KV cache stays BF16.
-
-2. Decode (``--kv-cache-dtype int8_qfa``, paged KV cache): the decode
-   operator contract (PA_NZ paged K/V, TND Q with NT q_descale,
-   per-token K descale stored per page, per-head static V descale).
-   One QFA call per step covers decode and prefill alike.
+``--kv-cache-dtype int8_qfa`` is the sole entry: the KV cache is packet-
+packed INT8 (PA_NZ paged K/V, TND Q with NT q_descale, per-token K
+descale stored per page, per-head static V descale). One QFA call per
+step covers decode and prefill alike.
 """
 
 import torch
@@ -35,8 +29,6 @@ from vllm.v1.attention.backend import AttentionType  # type: ignore[import-not-f
 from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
-    AscendAttentionState,
-    AscendC8AttentionBackendImpl,
     AscendMetadata,
 )
 from vllm_ascend.utils import logger
@@ -45,22 +37,7 @@ QFA_INT8_GQA_QUANT_MODE = 12
 QFA_INT8_SCALE_LEVEL = 127.0
 QFA_MASK_NO_MASK = 0
 QFA_MASK_CAUSAL = 3
-QFA_ABSMAX_EPS = 1e-12
 QFA_INT8_NZ_DIM_FRAG = 32
-
-
-def _quantize_per_token_head(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """[T, H, D] float -> INT8 payload + FP32 descale [T, H]."""
-    descale = x.abs().amax(dim=-1).clamp_min(QFA_ABSMAX_EPS).float() / QFA_INT8_SCALE_LEVEL
-    payload = (x.float() / descale.unsqueeze(-1)).round().clamp(-QFA_INT8_SCALE_LEVEL, QFA_INT8_SCALE_LEVEL)
-    return payload.to(torch.int8), descale
-
-
-def _quantize_per_head(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """[T, H, D] float -> INT8 payload + FP32 descale [H] shared over tokens."""
-    descale = x.abs().amax(dim=(0, 2)).clamp_min(QFA_ABSMAX_EPS).float() / QFA_INT8_SCALE_LEVEL
-    payload = (x.float() / descale.view(1, -1, 1)).round().clamp(-QFA_INT8_SCALE_LEVEL, QFA_INT8_SCALE_LEVEL)
-    return payload.to(torch.int8), descale
 
 
 def qfa_int8_packet_section_sizes(
@@ -185,111 +162,6 @@ def qfa_int8_paged_cache_views(
         _strided_view(kd_shape, k_elems, torch.float32, 4),           # K descale
         _strided_view(nz_shape, k_elems + 4 * kd_elems, torch.int8, 1),  # V payload
     )
-
-
-def _build_int8_cu_seqlens(attn_metadata) -> torch.Tensor:
-    """Real per-request cumulative query lengths into the operator's INT32 [B+1].
-
-    ``actual_seq_lengths_q`` carries the true batch (no padded tail) and is
-    what the FIA prefill paths already consume; prefix the mandatory 0.
-    """
-    device = attn_metadata.query_start_loc_gpu.device
-    return torch.tensor(
-        [0, *attn_metadata.actual_seq_lengths_q],
-        dtype=torch.int32,
-        device=device,
-    )
-
-
-class AscendQFA3PrefillBackendImpl(AscendAttentionBackendImpl):
-    """Stock backend impl with the PrefillNoCache branch routed to QFA INT8-GQA."""
-
-    _enable_logged = False
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        if self.head_size > 256:
-            raise ValueError(
-                f"A3 QFA INT8-GQA supports head_dim <= 256, got {self.head_size}."
-            )
-        if not AscendQFA3PrefillBackendImpl._enable_logged:
-            logger.info(
-                "A3 QFA INT8-GQA prefill attention enabled "
-                "(VLLM_ASCEND_QFA_A3_PREFILL=1); decode and chunked/prefix-hit "
-                "prefill keep the stock FIA path."
-            )
-            AscendQFA3PrefillBackendImpl._enable_logged = True
-
-    def forward_impl(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: tuple[torch.Tensor],
-        attn_metadata,
-        output: torch.Tensor,
-    ):
-        if (
-            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
-            and self.sliding_window is None
-            and self.kv_sharing_target_layer_name is None
-            and key is not None
-            and value is not None
-        ):
-            return self._forward_qfa_int8_prefill(query, key, value, attn_metadata, output)
-        return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
-
-    def _forward_qfa_int8_prefill(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        from cann_ops_transformer.ops import quant_flash_attn
-
-        num_tokens = attn_metadata.num_actual_tokens
-        # Q/K: fused per-token-head quantization (1 kernel each).
-        q_int8, q_descale = torch_npu.npu_dynamic_quant(query[:num_tokens], dst_type=torch.int8)
-        k_int8, k_descale = torch_npu.npu_dynamic_quant(key[:num_tokens], dst_type=torch.int8)
-        # V: per-head over all tokens; no fused kernel available (npu_quantize
-        # rejects BF16+FP32 scale), keep the manual chain.
-        v_int8, v_descale = _quantize_per_head(value[:num_tokens])
-        p_scale = torch.tensor([QFA_INT8_SCALE_LEVEL], dtype=torch.float32, device=query.device)
-
-        # PrefillNoCache: this step's K/V is the whole history, so the query
-        # prefix sums serve both sides.
-        cu_seqlens = _build_int8_cu_seqlens(attn_metadata)
-        max_seqlen = attn_metadata.max_query_len or num_tokens
-
-        attn_out, _ = quant_flash_attn(
-            q_int8,
-            k_int8,
-            v_int8,
-            q_descale,
-            k_descale,
-            v_descale,
-            QFA_INT8_GQA_QUANT_MODE,
-            p_scale=p_scale,
-            metadata=None,
-            layout_q="TND",
-            layout_q_descale="TND",
-            layout_kv="TND",
-            layout_out="TND",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-            mask_mode=QFA_MASK_CAUSAL if attn_metadata.causal else QFA_MASK_NO_MASK,
-            win_left=-1,
-            win_right=-1,
-            softmax_scale=self.scale,
-            return_softmax_lse=False,
-        )
-        # attn_out is [T, Hq, D] and the runner's output buffer shares that layout.
-        output[:num_tokens] = attn_out
-        return output
 
 
 class AscendQFA3Int8Impl(AscendAttentionBackendImpl):

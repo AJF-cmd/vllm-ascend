@@ -94,10 +94,6 @@ class AscendAttentionBackend(AttentionBackend):
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
 
             return AscendAttentionDCPImpl
-        if envs.VLLM_ASCEND_QFA_A3_PREFILL:
-            from vllm_ascend.attention.attention_a3_qfa import AscendQFA3PrefillBackendImpl
-
-            return AscendQFA3PrefillBackendImpl
         from vllm_ascend.utils import is_qfa_int8_kv_quant
 
         if is_qfa_int8_kv_quant(get_current_vllm_config()):
