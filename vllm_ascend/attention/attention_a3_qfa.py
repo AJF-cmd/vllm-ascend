@@ -26,7 +26,6 @@ import torch
 import torch_npu
 from vllm.v1.attention.backend import AttentionType  # type: ignore[import-not-found]
 
-from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendMetadata,
@@ -177,11 +176,9 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
     - Write path (reshape_and_cache): Q/K per-token-head dynamic
       quantization (``npu_dynamic_quant``), V static per-head
       (layer.v_cache_scale, the fa_v.scale calibration channel); K/V
-      payloads scattered by the triton ``scatter_kv_payload`` kernel,
-      which writes only the addressed bytes of the strided packet views
-      (``VLLM_ASCEND_QFA_SCATTER_WRITE=0`` falls back to the strided
-      index_put_ A/B reference, which materializes the whole per-layer
-      pool per call).
+      payloads and the K descale scattered by the triton kernels in
+      ``qfa_kv_scatter``, which write only the addressed bytes of the
+      strided packet views.
     - Read path: one QFA call per step for the whole batch (decode and
       prefill alike; the causal mask covers decode rows too).
 
@@ -197,33 +194,24 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
             logger.info(
                 "A3 QFA INT8 KV cache attention enabled "
                 "(--kv-cache-dtype int8_qfa); one QFA call per step for "
-                "decode and prefill alike. KV write path: %s "
-                "(VLLM_ASCEND_QFA_SCATTER_WRITE=%d).",
-                "triton scatter over the packet views"
-                if envs.VLLM_ASCEND_QFA_SCATTER_WRITE
-                else "strided index_put_ reference",
-                int(envs.VLLM_ASCEND_QFA_SCATTER_WRITE),
+                "decode and prefill alike. KV written via the triton "
+                "scatter kernels over the packet views."
             )
             AscendQFA3Int8Impl._logged = True
-        # Capture-safe constants: created lazily on first use (the eager
+        # Capture-safe constant: created lazily on first use (the eager
         # warmup run always precedes graph capture) and then reused at a
         # stable address -- replaying a graph must never repeat a
         # host->device copy (aclrtMemcpy is rejected in GLOBAL capture).
         self._p_scale = None
-        self._idx_n = None
-        self._idx_df = None
         self._ones_v_scale = None
 
     def _capture_safe_constants(self, device):
-        """p_scale / write-path index constants, built once per device."""
+        """p_scale, built once per device."""
         if self._p_scale is None or self._p_scale.device != device:
             self._p_scale = torch.tensor(
                 [QFA_INT8_SCALE_LEVEL], dtype=torch.float32, device=device
             )
-            self._idx_n = torch.arange(self.num_kv_heads, device=device).view(1, self.num_kv_heads, 1)
-            num_frags = self.head_size // QFA_INT8_NZ_DIM_FRAG
-            self._idx_df = torch.arange(num_frags, device=device).view(1, 1, num_frags)
-        return self._p_scale, self._idx_n, self._idx_df
+        return self._p_scale
 
     # ------------------------------------------------------------------
     # per-step derivations (graph-replay safe; shared across layers via
@@ -301,8 +289,8 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         k_int8, k_descale_tok = torch_npu.npu_dynamic_quant(
             key[:num_actual_tokens], dst_type=torch.int8
         )
-        # V static per-head scale: the fa_v.scale channel (ones until the
-        # calibrated weights land, Step 3).
+        # V static per-head scale: the calibrated fa_v.scale channel
+        # (layer.v_cache_scale, ones fallback for uncalibrated weights).
         v_scale = self._layer_v_scale(attn_metadata)
         v_int8 = torch.clamp(
             torch.round(value[:num_actual_tokens].float() / v_scale.view(1, -1, 1)),
@@ -312,59 +300,17 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
 
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         pages, pos = self._step_slot_index(attn_metadata, slot_mapping)
-        num_tokens = pages.shape[0]
-        n_heads = self.num_kv_heads
-        head_dim = self.head_size
-        nz_last = QFA_INT8_NZ_DIM_FRAG
 
-        if envs.VLLM_ASCEND_QFA_SCATTER_WRITE:
-            # Triton scatter: write only the addressed bytes of the strided
-            # packet views (the mxfp_k_scale pattern). Strided index_put_
-            # materializes the whole per-layer pool per call and NPU IndexPut
-            # can copy the strided view back, overwriting unrelated pages.
-            # The fused npu_scatter_pa_kv_cache operator is NOT usable here:
-            # probe v8 (2026-11-20) confirmed it addresses blocks by the
-            # shape's inner product and ignores the packet views' dim0
-            # stride, while the per-page packet layout always interleaves
-            # the descale section between K and V (dim0 stride != inner
-            # product). Padded rows are clamped to slot 0 (null block)
-            # upstream, keeping shapes static for aclgraph capture.
-            from vllm_ascend.ops.triton.qfa_kv_scatter import (
-                scatter_k_descale,
-                scatter_kv_payload,
-            )
+        # Padded rows arrive clamped to slot 0 (null block), keeping shapes
+        # static for aclgraph capture.
+        from vllm_ascend.ops.triton.qfa_kv_scatter import (
+            scatter_k_descale,
+            scatter_kv_payload,
+        )
 
-            scatter_kv_payload(k_int8, k_nz, (pages, pos))
-            scatter_kv_payload(v_int8, v_nz, (pages, pos))
-            scatter_k_descale(k_descale_tok, k_descale, (pages, pos))
-        else:
-            # A/B reference: scatter payloads into the NZ views via strided
-            # index_put_. A token's K/V payload is the [Df, 32] tail at
-            # (page, n, :, pos, :): index the leading four dims with
-            # (page, n, df, pos) tensors broadcast to [T, N, Df] and leave
-            # the 32-wide fragment axis implicit. The 3-index form leaves
-            # (Bs, 32) as the trailing dims and mismatches the [T, N, Df, 32]
-            # payload (probe v2 verified index_put on the 4-D BNBD layout,
-            # not this 5-D NZ one). The index constants come from the cached
-            # capture-safe set (torch.arange inside capture may
-            # host-generate).
-            _, idx_n, idx_df = self._capture_safe_constants(pages.device)
-            num_frags = idx_df.numel()  # head_dim // 32, kept in the cached set
-            nz_index = (
-                pages.view(num_tokens, 1, 1).expand(num_tokens, n_heads, num_frags),
-                idx_n.expand(num_tokens, n_heads, num_frags),
-                idx_df.expand(num_tokens, n_heads, num_frags),
-                pos.view(num_tokens, 1, 1).expand(num_tokens, n_heads, num_frags),
-            )
-            payload_src = k_int8.view(num_tokens, n_heads, num_frags, nz_last)
-            k_nz.index_put_(nz_index, payload_src)
-            payload_src_v = v_int8.view(num_tokens, n_heads, num_frags, nz_last)
-            v_nz.index_put_(nz_index, payload_src_v)
-            # K descale [T, N] -> (Bn, N, Bs): the 3-D view is fully indexed.
-            idx_page = pages.view(num_tokens, 1).expand(num_tokens, n_heads)
-            idx_n_2d = idx_n.view(1, n_heads).expand(num_tokens, n_heads)
-            idx_pos = pos.view(num_tokens, 1).expand(num_tokens, n_heads)
-            k_descale.index_put_((idx_page, idx_n_2d, idx_pos), k_descale_tok)
+        scatter_kv_payload(k_int8, k_nz, (pages, pos))
+        scatter_kv_payload(v_int8, v_nz, (pages, pos))
+        scatter_k_descale(k_descale_tok, k_descale, (pages, pos))
 
         from vllm_ascend.attention.attention_v1 import notify_kv_cache_written
 
@@ -436,10 +382,6 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         self.key_cache = k_nz
         self.value_cache = v_nz
 
-        # Direct-write mode (c8_mxfp pattern): quantize and scatter K/V plus
-        # the K descale through this impl's own reshape_and_cache. The stock
-        # forward cannot be reused here -- past its cache-update hook it runs
-        # the BF16 FIA/paged-attention kernels against the int8 packet views.
         # KV-sharing consumer layers reuse another layer's cache; writing
         # their (dummy) K/V would corrupt the shared slots.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
@@ -457,7 +399,7 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
         # Cached capture-safe constant: torch.tensor(..., device=npu) is a
         # host->device copy, rejected under aclgraph capture (GLOBAL mode);
         # the eager warmup run that always precedes capture creates it once.
-        p_scale, _, _ = self._capture_safe_constants(query.device)
+        p_scale = self._capture_safe_constants(query.device)
 
         cu_seqlens_q, seqused_kv = self._step_lengths(attn_metadata, num_tokens)
         max_seqlen_q = attn_metadata.max_query_len or num_tokens
@@ -482,13 +424,10 @@ class AscendQFA3Int8Impl(AscendAttentionBackendImpl):
             win_left=-1,
             win_right=-1,
             max_seqlen_q=max_seqlen_q,
-            # Contract: an int upper bound on the real max KV length, used
-            # for tiling planning ("not smaller than the actual max"). The
-            # -1 default produces corrupted numerics on this build (probe
-            # 2026-11-17: rel_fro 1588%) and a per-step .item() is a D2H
-            # sync that graph capture rejects -- so pin the model-length
-            # constant, which the contract admits and capture freezes
-            # safely.
+            # Contract: an int upper bound on the real max KV length ("not
+            # smaller than the actual max"); the -1 default produces
+            # corrupted numerics, and a per-step .item() is a D2H sync that
+            # graph capture rejects -- pin the model-length constant.
             max_seqlen_kv=int(self.vllm_config.model_config.max_model_len),
             layout_q="TND",
             layout_q_descale="NT",

@@ -26,7 +26,7 @@
     3. Launch one Triton program per 256 flattened source bytes, masking elements beyond `T * H * D`.
     4. Decompose each flattened index into token, head, fragment, and lane coordinates. Load block/pos indices using their actual strides.
     5. Promote address coordinates to int64, calculate the destination offset, and store the unchanged source byte directly. No cache-wide temporary view or writeback is created.
-- **Supported modes**: Ascend NPU eager execution and ACL graph capture/replay with Triton-Ascend. Hardware validation status is tracked in the A3 QFA workstream (probe_scatter_pa_v8 byte-exact parity plus service-level regression); this document does not establish additional hardware support beyond that evidence.
+- **Supported modes**: Ascend NPU eager execution and ACL graph capture/replay with Triton-Ascend. Hardware validation was performed on Atlas A3 (Ascend 910_93) with CANN 9.2.0. Other platform validation is N/A; this document does not establish additional hardware support.
 
 ## Parameters
 
@@ -47,7 +47,7 @@ All three arguments are required. The Python function returns `None` and updates
 
 - Source, destination, and all index tensors must reside on the same NPU. CPU inference is not supported by this update path.
 - Source shape and element size must satisfy `payload.numel() == T * H * D`. For a nonempty index batch, a mismatched source element count raises `ValueError` before kernel launch.
-- The cache must be a valid, non-overlapping PA_NZ byte view whose last dimension is 32. Actual page strides include the interleaved K-descale section and page padding; the kernel uses the supplied strides rather than assuming contiguous pages. The fused `npu_scatter_pa_kv_cache` operator is not usable on this layout: it addresses blocks by the shape's inner product and ignores the dim0 stride (probe_scatter_pa_v8, 2026-11-20).
+- The cache must be a valid, non-overlapping PA_NZ byte view whose last dimension is 32. Actual page strides include the interleaved K-descale section and page padding; the kernel uses the supplied strides rather than assuming contiguous pages. The fused `npu_scatter_pa_kv_cache` operator is not usable on this layout: it addresses blocks by the shape's inner product and ignores the dim0 stride, which the per-page packet layout never satisfies.
 - Indices must already be valid: `0 <= block_ids < num_blocks` and `0 <= pos_ids < B`. The kernel does not clamp or bounds-check their values. The attention caller clamps padded slot `-1` to the reserved null slot before constructing these indices.
 - Real tokens must not target the same destination element. Padded rows may target the reserved null slot, whose final value is ignored.
 - Source and index storage must not overlap the destination writes. Concurrent writers must address disjoint destination bytes.
@@ -60,21 +60,15 @@ All three arguments are required. The Python function returns `None` and updates
 
 - **Origin**: Developed for the A3 QFA INT8 KV write path in `vllm_ascend/attention/attention_a3_qfa.py`. Modeled on `scatter_k_scales` in `vllm_ascend/ops/triton/mxfp_k_scale.py`; this is not a port of an upstream vLLM Triton operator.
 - **Differences**:
-    - The original write path used advanced-index assignment into the strided 5-D packet views. On NPU, IndexPut materializes the whole per-layer pool per call (~8.5 ms/layer at 17k blocks) and can copy the strided view back, overwriting unrelated pages. The targeted kernel stores only the addressed bytes.
+    - On NPU, the original IndexPut path on the strided 5-D packet views can materialize the whole per-layer pool per call and copy the strided view back, overwriting unrelated pages. The targeted kernels store only the addressed bytes.
+    - Payload programs are mapped one per (token, head): the index math runs once per program and the loads/stores vectorize without a tail mask (the grid is exact); the K-descale row gets its own one-program-per-token kernel.
     - Preserve the byte assignment and the existing per-page packet layout `[K | K_descale | V]` while honoring page strides, storage offsets, and all destination strides.
     - Keep the `int8_qfa` cache representation, QFA attention operator interfaces, and launch configuration unchanged.
     - Add no host-side tensor-value reads or device-wide synchronization to the production update path.
 
 ## Test Cases
 
-Byte-exact parity against the strided index_put_ reference, including sentinel write-range checks over the whole group-packed allocation, runs from the A3 workstream probe:
-
-```bash
-VLLM_ASCEND_REPO=<vllm-ascend checkout> \
-ASCEND_RT_VISIBLE_DEVICES=<cards> python3 probe_scatter_pa_v8.py
-```
-
-The probe covers: builder geometry cross-check; same-page, page-crossing, prefill (4-page), shuffled-slot, and H=4 cases; overlapping slots (last write wins); padded slots clamped to the null slot; and a service-scale (~100k block) timing comparison against the index_put_ reference. Service-level regression (L1-L6 alternating burst plus the standard burst suite) and decode throughput A/B (`VLLM_ASCEND_QFA_SCATTER_WRITE=1` vs `0`) complete the validation.
+Validation compares full raw allocations byte-for-byte against a CPU/index_put_ reference, covering: builder geometry cross-check; same-page, page-crossing, prefill (4-page), shuffled-slot, and H=4 cases; overlapping slots (last write wins); padded slots clamped to the null slot; sentinel write-range checks over the whole group-packed allocation; and a service-scale (~100k block) timing comparison against the index_put_ reference. Service-level regression (alternating same-prompt bursts plus the standard burst suite) completes the validation.
 
 ## Example
 

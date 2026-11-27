@@ -1,21 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Write int8_qfa K/V payloads without materializing strided packet views.
+"""Scatter int8_qfa K/V payloads and K descale into the paged packet views.
 
-Strided index_put_ on the 5-D PA_NZ packet views materializes the
-whole per-layer pool per write and NPU IndexPut can copy the strided
-view back, overwriting unrelated pages. The kernels below write only the
-addressed bytes instead, consuming the packet views' strides exactly like
-``vllm_ascend.ops.triton.mxfp_k_scale.scatter_k_scales`` does for the
-C8-MXFP scale cache.
-
-v2 (2026-11-25, profile-driven): the payload kernel's flat element walk
-(div/mod chain and per-element block_ids loads on every byte) ran at
-~2 GB/s effective write bandwidth on prefill shapes (6.7 ms for a 13 MB
-layer write, 12.6% of the 128k profile window). Programs are now mapped
-one per (token, head): the index math happens once per program, loads and
-stores vectorize without a tail mask (the grid is exact), and the K-descale
-row gets its own kernel, retiring the last index_put_ on the path.
+The kernels write only the addressed bytes, consuming the packet views'
+strides explicitly (the mxfp_k_scale pattern). Design history and the
+rationale for the program mapping live in docs/qfa_kv_scatter.md.
 """
 
 import torch
@@ -83,9 +72,7 @@ def _scatter_k_descale_kernel(
     pos_index_stride: tl.constexpr,
 ):
     # One program scatters one token's per-head FP32 descale row [N] into
-    # (blocks, N, Bs). Replaces the strided index_put_ whose 17.9 MB view
-    # materialization cost ~24 us/layer and whose IndexPut copy-back is
-    # structurally unsafe (see mxfp_k_scale docs).
+    # (blocks, N, Bs).
     token = tl.program_id(0)
     head_offs = tl.arange(0, num_heads)
     block = tl.load(block_ids + token * block_index_stride).to(tl.int64)
