@@ -41,8 +41,8 @@ def _views_on(raw, heads, blocks, padding=0):
 
 def _payloads(tokens, heads, seed):
     g = torch.Generator().manual_seed(seed)
-    k = torch.randint(-127, 128, (tokens, heads, DIM), generator=g)
-    v = torch.randint(-127, 128, (tokens, heads, DIM), generator=g)
+    k = torch.randint(-127, 128, (tokens, heads, DIM), generator=g).to(torch.int8)
+    v = torch.randint(-127, 128, (tokens, heads, DIM), generator=g).to(torch.int8)
     kd = (torch.rand((tokens, heads), generator=g) * 3.0).to(torch.float32)
     return k, v, kd
 
